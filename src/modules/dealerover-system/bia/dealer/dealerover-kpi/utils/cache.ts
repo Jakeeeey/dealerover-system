@@ -4,7 +4,7 @@ interface CacheEntry<T> {
 }
 
 class SimpleMemoryCache {
-  private store = new Map<string, CacheEntry<any>>();
+  private store = new Map<string, CacheEntry<unknown>>();
 
   get<T>(key: string): T | null {
     const entry = this.store.get(key);
