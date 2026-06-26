@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ProductSalesDetail } from "@/modules/dealerover-system/bia/dealer/dealerover-kpi/types";
+import { dealeroverCache } from "@/modules/dealerover-system/bia/dealer/dealerover-kpi/utils/cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -88,6 +89,12 @@ export async function GET(req: NextRequest) {
 
         if (!namespacedSalesmanId || !supplierId || !startDate || !endDate) {
             return NextResponse.json({ error: "Missing required parameters" }, { status: 400 });
+        }
+
+        const cacheKey = `dealerover_customer_products_${namespacedSalesmanId}_${supplierId}_${startDate}_${endDate}_${identifier || ''}`;
+        const cachedData = dealeroverCache.get(cacheKey);
+        if (cachedData) {
+            return NextResponse.json(cachedData);
         }
 
         const namespacedId = Number(namespacedSalesmanId);
@@ -246,7 +253,9 @@ export async function GET(req: NextRequest) {
             });
         }
 
-        return NextResponse.json(Array.from(aggregatedMap.values()));
+        const finalResult = Array.from(aggregatedMap.values());
+        dealeroverCache.set(cacheKey, finalResult);
+        return NextResponse.json(finalResult);
 
     } catch (error) {
         console.error("[Customer Products API Error]:", error);
