@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { dealeroverCache } from "@/modules/dealerover-system/bia/dealer/dealerover-kpi/utils/cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -132,6 +133,12 @@ export async function GET(req: NextRequest) {
             return NextResponse.json({ error: "Missing required parameters" }, { status: 400 });
         }
 
+        const cacheKey = `dealerover_customer_targets_${namespacedSalesmanIds.join(',')}_${startDate}_${endDate}_${viewType}`;
+        const cachedData = dealeroverCache.get(cacheKey);
+        if (cachedData) {
+            return NextResponse.json(cachedData);
+        }
+
         const namespacedId = Number(namespacedSalesmanIds[0]);
         const dealerId = Math.floor(namespacedId / 10000);
         const localSalesmanId = namespacedId % 10000;
@@ -152,6 +159,7 @@ export async function GET(req: NextRequest) {
             viewType
         );
 
+        dealeroverCache.set(cacheKey, data);
         return NextResponse.json(data);
 
     } catch (error) {

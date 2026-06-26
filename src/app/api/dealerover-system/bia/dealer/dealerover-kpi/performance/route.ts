@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { VSalesPerformanceDataDto } from "@/modules/dealerover-system/bia/dealer/dealerover-kpi/types";
+import { dealeroverCache } from "@/modules/dealerover-system/bia/dealer/dealerover-kpi/utils/cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -112,6 +113,12 @@ export async function GET(req: NextRequest) {
     const startDate = searchParams.get("startDate") || "";
     const endDate = searchParams.get("endDate") || "";
 
+    const cacheKey = `dealerover_performance_${startDate}_${endDate}`;
+    const cachedData = dealeroverCache.get(cacheKey);
+    if (cachedData) {
+        return NextResponse.json(cachedData);
+    }
+
     try {
         const dealers = await fetchDealersList();
         const combinedPerformance: VSalesPerformanceDataDto[] = [];
@@ -137,6 +144,7 @@ export async function GET(req: NextRequest) {
             })
         );
 
+        dealeroverCache.set(cacheKey, combinedPerformance);
         return NextResponse.json(combinedPerformance);
 
     } catch (error) {

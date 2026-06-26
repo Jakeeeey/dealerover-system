@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { SupervisorMapping, SalesmanMapping, SalesmanMaster } from "@/modules/dealerover-system/bia/dealer/dealerover-kpi/types";
+import { dealeroverCache } from "@/modules/dealerover-system/bia/dealer/dealerover-kpi/utils/cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -61,6 +62,12 @@ async function fetchDealerSalesmen(directusUrl: string, directusToken: string): 
 }
 
 export async function GET() {
+    const cacheKey = "dealerover_mapping";
+    const cachedData = dealeroverCache.get(cacheKey);
+    if (cachedData) {
+        return NextResponse.json(cachedData);
+    }
+
     try {
         // 1. Fetch the list of all dealers from main database
         const dealers = await fetchDealersList();
@@ -114,11 +121,14 @@ export async function GET() {
             })
         );
 
-        return NextResponse.json({
+        const responseData = {
             supervisors: supervisorsList,
             salesmanMappings: salesmanMappingsList,
             salesmanMaster: salesmanMasterList
-        });
+        };
+
+        dealeroverCache.set(cacheKey, responseData);
+        return NextResponse.json(responseData);
 
     } catch (error) {
         const err = error as Error;

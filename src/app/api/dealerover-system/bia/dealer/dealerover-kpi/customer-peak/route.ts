@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { VSalesPerformanceDataDto } from "@/modules/dealerover-system/bia/dealer/dealerover-kpi/types";
+import { dealeroverCache } from "@/modules/dealerover-system/bia/dealer/dealerover-kpi/utils/cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -117,6 +118,12 @@ export async function GET(req: NextRequest) {
             return NextResponse.json({ error: "ids is required" }, { status: 400 });
         }
 
+        const cacheKey = `dealerover_customer_peak_${namespacedSalesmanIds.join(',')}_${viewType}_${storeTypeFilter || ''}_${names.join(',')}`;
+        const cachedData = dealeroverCache.get(cacheKey);
+        if (cachedData) {
+            return NextResponse.json(cachedData);
+        }
+
         const namespacedId = namespacedSalesmanIds[0];
         const dealerId = Math.floor(namespacedId / 10000);
         const localSalesmanId = namespacedId % 10000;
@@ -232,6 +239,7 @@ export async function GET(req: NextRequest) {
             };
         });
 
+        dealeroverCache.set(cacheKey, finalMap);
         return NextResponse.json(finalMap);
 
     } catch (error) {

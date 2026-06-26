@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { TargetSettingSalesman } from "@/modules/dealerover-system/bia/dealer/dealerover-kpi/types";
+import { dealeroverCache } from "@/modules/dealerover-system/bia/dealer/dealerover-kpi/utils/cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -72,6 +73,12 @@ export async function GET(req: NextRequest) {
         return NextResponse.json({ error: "Missing startDate or endDate" }, { status: 400 });
     }
 
+    const cacheKey = `dealerover_targets_${startDate}_${endDate}`;
+    const cachedData = dealeroverCache.get(cacheKey);
+    if (cachedData) {
+        return NextResponse.json(cachedData);
+    }
+
     try {
         const dealers = await fetchDealersList();
         const combinedSalesmanTargets: TargetSettingSalesman[] = [];
@@ -96,9 +103,11 @@ export async function GET(req: NextRequest) {
             })
         );
 
-        return NextResponse.json({
+        const responseData = {
             salesmanTargets: combinedSalesmanTargets
-        });
+        };
+        dealeroverCache.set(cacheKey, responseData);
+        return NextResponse.json(responseData);
 
     } catch (error) {
         console.error("[Dealer Targets API Error]:", error);
