@@ -13,7 +13,7 @@ class SimpleMemoryCache {
       this.store.delete(key);
       return null;
     }
-    return entry.data;
+    return entry.data as T;
   }
 
   set<T>(key: string, data: T, ttlMs: number = 30 * 60 * 1000): void {
