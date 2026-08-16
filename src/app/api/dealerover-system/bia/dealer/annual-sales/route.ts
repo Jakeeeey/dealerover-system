@@ -35,24 +35,6 @@ async function fetchDealersList(): Promise<DirectusDealer[]> {
   return json.data || [];
 }
 
-/**
- * dealer_list currently has an exact duplicate row for every real dealer
- * (different dealer_id, identical name/springboot URL) — see
- * playbook-erp-dealerover-bia-frontend.md §7.1. De-duped here defensively
- * so the dropdown doesn't show every dealer twice; the underlying Directus
- * data issue itself is tracked separately and NOT fixed by this dedup.
- */
-function dedupeDealers(dealers: DirectusDealer[]): DirectusDealer[] {
-  const seen = new Set<string>();
-  const result: DirectusDealer[] = [];
-  for (const d of dealers) {
-    const key = `${(d.dealer_name || "").trim().toLowerCase()}|${(d.springboot || "").trim().toLowerCase()}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push(d);
-  }
-  return result;
-}
 
 async function loginToDealerSpringBoot(springbootUrl: string): Promise<string | null> {
   const cleanBase = springbootUrl.replace(/\/+$/, "");
@@ -201,10 +183,9 @@ async function getCachedDealerList(): Promise<DirectusDealer[]> {
     return DEALER_LIST_CACHE.data;
   }
   const raw = await fetchDealersList();
-  const deduped = dedupeDealers(raw);
-  DEALER_LIST_CACHE.data = deduped;
+  DEALER_LIST_CACHE.data = raw;
   DEALER_LIST_CACHE.expiry = now + DEALER_LIST_TTL;
-  return deduped;
+  return raw;
 }
 
 export async function GET(req: NextRequest) {
