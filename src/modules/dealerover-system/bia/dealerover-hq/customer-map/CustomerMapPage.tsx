@@ -3,7 +3,6 @@
 import * as React from "react";
 import { MapPinned, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { ErrorPage } from "@/app/(dealerover-system)/dealerover-system/_components/ErrorPage";
 import {
@@ -191,29 +190,31 @@ export default function CustomerMapPage() {
   }
 
   return (
-    <div className="mx-auto min-h-screen max-w-[1600px] space-y-6 p-2 pt-6 sm:p-6 md:p-10">
-      <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-        <div className="flex items-start gap-3">
-          <div className="rounded-2xl bg-primary/10 p-3">
-            <MapPinned className="size-6 text-primary" />
+    <div className="flex min-h-0 flex-1 flex-col gap-3 p-2 sm:p-4 lg:p-5">
+      <div className="flex shrink-0 items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <div className="shrink-0 rounded-xl bg-primary/10 p-2">
+            <MapPinned className="size-5 text-primary" />
           </div>
-          <div className="space-y-1">
-            <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">Customer Map</h1>
-            <p className="text-sm text-muted-foreground">
+          <div className="min-w-0">
+            <h1 className="truncate text-base font-semibold tracking-tight sm:text-lg">
+              Customer Map
+            </h1>
+            <p className="hidden truncate text-xs text-muted-foreground sm:block">
               Active customer locations across every dealer under HQ, coloured by dealer.
             </p>
           </div>
         </div>
         <Button
-          variant="ghost"
-          size="icon"
+          variant="outline"
+          size="sm"
           onClick={refresh}
           disabled={isLoading}
-          className="h-9 w-9 shrink-0 self-start"
+          className="h-9 shrink-0 gap-2"
           title="Refresh data"
-          aria-label="Refresh data"
         >
           <RefreshCw className={cn("size-4", isLoading && "animate-spin")} />
+          <span className="hidden sm:inline">Refresh</span>
         </Button>
       </div>
 
@@ -233,16 +234,14 @@ export default function CustomerMapPage() {
         disabled={isLoading}
       />
 
-      <Card className="shadow-none border-border overflow-hidden">
-        <CardContent className="p-4 sm:p-6">
-          <CustomerMapView
-            customers={filteredCustomers}
-            dealers={dealers}
-            dealerStatuses={data?.dealerStatuses ?? []}
-            perDealerCounts={perDealerCounts}
-          />
-        </CardContent>
-      </Card>
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-card">
+        <CustomerMapView
+          customers={filteredCustomers}
+          dealers={dealers}
+          dealerStatuses={data?.dealerStatuses ?? []}
+          perDealerCounts={perDealerCounts}
+        />
+      </div>
     </div>
   );
 }

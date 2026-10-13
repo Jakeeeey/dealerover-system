@@ -107,6 +107,7 @@ export function CustomerMapView({
   const mapRef = React.useRef<MapLibreMap | null>(null);
   const [mapReady, setMapReady] = React.useState(false);
   const [selected, setSelected] = React.useState<CustomerFeatureProps | null>(null);
+  const [legendOpen, setLegendOpen] = React.useState(true);
 
   const colors = React.useMemo(() => {
     const map: Record<string, string> = {};
@@ -226,59 +227,28 @@ export function CustomerMapView({
   }, [customers, colors, mapReady]);
 
   return (
-    <div className="space-y-4">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-        <div className="flex items-baseline gap-2">
-          <span className="text-2xl font-semibold tabular-nums">{formatNumber(customers.length)}</span>
-          <span className="text-sm text-muted-foreground">customers plotted</span>
-        </div>
-
-        <ul className="flex flex-wrap items-center gap-x-5 gap-y-2">
-          {dealers.map((dealer) => {
-            const status = dealerStatuses.find((entry) => entry.dealerId === dealer.id);
-            const offline = status ? !status.online : false;
-            return (
-              <li key={dealer.id} className="flex min-w-0 items-center gap-2 text-sm">
-                <span
-                  className="size-3 shrink-0 rounded-full ring-1 ring-border"
-                  style={{ backgroundColor: dealer.color }}
-                  aria-hidden
-                />
-                <span className="max-w-[180px] truncate" title={dealer.name}>
-                  {dealer.name}
-                </span>
-                {offline ? (
-                  <span className="rounded-full border border-destructive/40 px-2 py-0.5 text-[11px] font-medium text-destructive">
-                    offline
-                  </span>
-                ) : (
-                  <span className="tabular-nums text-muted-foreground">
-                    {formatNumber(perDealerCounts[dealer.id] ?? 0)}
-                  </span>
-                )}
-              </li>
-            );
-          })}
-        </ul>
-      </div>
-
+    <div className="flex min-h-0 flex-1 flex-col">
       {offlineDealers.length > 0 && (
-        <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-          <CircleAlert className="mt-0.5 size-4 shrink-0" />
-          <span className="min-w-0">
+        <div className="flex shrink-0 items-center gap-2 border-b border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <CircleAlert className="size-4 shrink-0" aria-hidden />
+          <span className="min-w-0 truncate" title={offlineDealers.map((d) => d.dealerName).join(", ")}>
             {offlineDealers.map((dealer) => dealer.dealerName).join(", ")}{" "}
-            {offlineDealers.length === 1 ? "is" : "are"} offline — their customers are not shown.
+            {offlineDealers.length === 1 ? "is" : "are"} offline — their customers are hidden.
           </span>
         </div>
       )}
 
-      <div className="relative h-[60vh] min-h-[420px] w-full overflow-hidden rounded-2xl border bg-muted">
-        <div
-          ref={containerRef}
-          className="h-full w-full"
-          role="region"
-          aria-label="Customer location map"
-        />
+      <div className="relative min-h-0 flex-1 bg-muted">
+        {/* Maplibre adds `.maplibregl-map` (position: relative) to its container, which would
+            override `absolute`; wrap it so an inset-0 shell gives the map a definite height. */}
+        <div className="absolute inset-0">
+          <div
+            ref={containerRef}
+            className="h-full w-full"
+            role="region"
+            aria-label="Customer location map"
+          />
+        </div>
 
         {!mapReady && (
           <div className="absolute inset-0 flex items-center justify-center bg-muted">
@@ -291,21 +261,22 @@ export function CustomerMapView({
             <div className="flex max-w-sm flex-col items-center gap-2 rounded-xl border bg-card/95 px-6 py-6 text-center shadow-sm">
               <MapPinOff className="size-8 text-muted-foreground" />
               <p className="text-sm font-medium">No customers match the current filters.</p>
-              <p className="text-xs text-muted-foreground">
-                Adjust the filters above to widen the result set.
-              </p>
+              <p className="text-xs text-muted-foreground">Adjust the filters to widen the result set.</p>
             </div>
           </div>
         )}
 
         {selected && (
-          <div className="absolute inset-x-3 bottom-3 z-10 sm:inset-x-auto sm:left-3 sm:max-w-sm">
+          <div className="absolute left-3 top-3 z-10 w-[min(20rem,calc(100%-1.5rem))]">
             <div className="rounded-xl border bg-card p-4 shadow-md">
               <div className="flex items-start justify-between gap-3">
                 <div className="flex min-w-0 items-start gap-2">
                   <MapPin className="mt-0.5 size-4 shrink-0" style={{ color: selected.color }} />
                   <div className="min-w-0">
-                    <p className="truncate text-sm font-semibold" title={selected.storeName || selected.customerName}>
+                    <p
+                      className="truncate text-sm font-semibold"
+                      title={selected.storeName || selected.customerName}
+                    >
                       {selected.storeName || selected.customerName || "Customer"}
                     </p>
                     <p className="truncate text-xs text-muted-foreground" title={selected.customerCode}>
@@ -338,6 +309,55 @@ export function CustomerMapView({
               </div>
             </div>
           </div>
+        )}
+      </div>
+
+      {/* Dealer legend banner — scrolls horizontally so many dealers never wrap or eat map height. */}
+      <div className="flex shrink-0 items-center gap-3 overflow-x-auto border-t bg-card px-3 py-2">
+        <button
+          type="button"
+          onClick={() => setLegendOpen((open) => !open)}
+          className="shrink-0 whitespace-nowrap text-xs text-muted-foreground transition-colors hover:text-foreground"
+          title={legendOpen ? "Hide legend" : "Show legend"}
+        >
+          <span className="font-semibold tabular-nums text-foreground">
+            {formatNumber(customers.length)}
+          </span>{" "}
+          plotted
+        </button>
+
+        {legendOpen && (
+          <>
+            <span className="h-4 w-px shrink-0 bg-border" aria-hidden />
+            <ul className="flex items-center gap-2">
+              {dealers.map((dealer) => {
+                const status = dealerStatuses.find((entry) => entry.dealerId === dealer.id);
+                const offline = status ? !status.online : false;
+                return (
+                  <li
+                    key={dealer.id}
+                    className="flex shrink-0 items-center gap-2 rounded-full border border-border px-2.5 py-1 text-xs"
+                  >
+                    <span
+                      className="size-2.5 shrink-0 rounded-full ring-1 ring-border"
+                      style={{ backgroundColor: dealer.color }}
+                      aria-hidden
+                    />
+                    <span className="max-w-[160px] truncate" title={dealer.name}>
+                      {dealer.name}
+                    </span>
+                    {offline ? (
+                      <span className="font-medium text-destructive">offline</span>
+                    ) : (
+                      <span className="tabular-nums text-muted-foreground">
+                        {formatNumber(perDealerCounts[dealer.id] ?? 0)}
+                      </span>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </>
         )}
       </div>
     </div>

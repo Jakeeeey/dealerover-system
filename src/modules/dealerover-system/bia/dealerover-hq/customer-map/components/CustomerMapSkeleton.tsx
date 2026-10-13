@@ -1,37 +1,24 @@
 "use client";
 
 import { Skeleton } from "@/components/ui/skeleton";
-import { Card, CardContent } from "@/components/ui/card";
 
-/** Loading placeholder shaped like the filter bar + map surface that follows. */
+/** Loading placeholder shaped like the command bar + filter strip + map surface that follows. */
 export function CustomerMapSkeleton() {
   return (
-    <div className="space-y-6 p-2 sm:p-6 md:p-10 pt-6">
-      <div className="space-y-2">
-        <Skeleton className="h-8 w-56" />
-        <Skeleton className="h-4 w-72" />
+    <div className="flex min-h-0 flex-1 flex-col gap-3 p-2 sm:p-4 lg:p-5">
+      <div className="flex shrink-0 items-center justify-between gap-3">
+        <div className="space-y-2">
+          <Skeleton className="h-6 w-44" />
+          <Skeleton className="hidden h-3.5 w-72 sm:block" />
+        </div>
+        <Skeleton className="h-9 w-24 rounded-md" />
       </div>
 
-      <Card className="shadow-none border-border">
-        <CardContent className="p-3">
-          <div className="flex flex-wrap gap-2">
-            <Skeleton className="h-8 w-44" />
-            <Skeleton className="h-8 w-36" />
-            <Skeleton className="h-8 w-36" />
-            <Skeleton className="h-8 w-36" />
-            <Skeleton className="h-8 w-40" />
-            <Skeleton className="h-8 w-56" />
-          </div>
-        </CardContent>
-      </Card>
+      <Skeleton className="h-11 w-full shrink-0 rounded-xl" />
 
-      <div className="flex flex-wrap items-center gap-4">
-        <Skeleton className="h-8 w-40" />
-        <Skeleton className="h-6 w-32" />
-        <Skeleton className="h-6 w-32" />
+      <div className="relative min-h-0 flex-1 overflow-hidden rounded-2xl border border-border">
+        <Skeleton className="absolute inset-0 rounded-2xl" />
       </div>
-
-      <Skeleton className="h-[60vh] min-h-[420px] w-full rounded-2xl" />
     </div>
   );
 }

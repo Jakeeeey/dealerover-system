@@ -112,7 +112,9 @@ export default async function Page() {
                 </div>
             </header>
 
-            <main className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden">
+            {/* Full-height map dashboard: the module fills this region and manages its own
+                internal layout, so the page itself never scrolls. */}
+            <main className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
                 <CustomerMapPage />
             </main>
         </div>
