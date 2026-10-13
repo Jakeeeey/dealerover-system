@@ -14,12 +14,8 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { Popover, PopoverTrigger } from "@/components/ui/popover";
+import { PopoverStageContent } from "./PopoverStageContent";
 import { cn } from "@/lib/utils";
 import type { CustomerMapBasemap, CustomerMapMarkerStyle } from "../types";
 
@@ -66,6 +62,7 @@ export function MapStyleSwitch({
   basemap,
   onBasemapChange,
 }: MapStyleSwitchProps) {
+  const [basemapOpen, setBasemapOpen] = React.useState(false);
   const currentBasemap = BASEMAP_OPTIONS.find((option) => option.value === basemap) ?? BASEMAP_OPTIONS[0];
 
   return (
@@ -99,30 +96,39 @@ export function MapStyleSwitch({
         })}
       </div>
 
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
+      <Popover open={basemapOpen} onOpenChange={setBasemapOpen}>
+        <PopoverTrigger asChild>
           <Button variant="outline" size="sm" className="h-9 gap-1.5" title="Basemap style">
             <Layers className="size-4" />
             {currentBasemap.label}
           </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-40">
-          {BASEMAP_OPTIONS.map((option) => {
-            const Icon = option.icon;
-            return (
-              <DropdownMenuItem
-                key={option.value}
-                onSelect={() => onBasemapChange(option.value)}
-                className="gap-2 text-xs"
-              >
-                <Icon className="size-3.5" />
-                {option.label}
-                {basemap === option.value && <Check className="ml-auto size-3.5" />}
-              </DropdownMenuItem>
-            );
-          })}
-        </DropdownMenuContent>
-      </DropdownMenu>
+        </PopoverTrigger>
+        <PopoverStageContent align="end" className="w-40 p-1">
+          <ul className="flex flex-col gap-0.5">
+            {BASEMAP_OPTIONS.map((option) => {
+              const Icon = option.icon;
+              const active = basemap === option.value;
+              return (
+                <li key={option.value}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onBasemapChange(option.value);
+                      setBasemapOpen(false);
+                    }}
+                    aria-pressed={active}
+                    className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs transition-colors hover:bg-accent hover:text-accent-foreground"
+                  >
+                    <Icon className="size-3.5" />
+                    <span className="flex-1 text-left">{option.label}</span>
+                    {active && <Check className="ml-auto size-3.5" />}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </PopoverStageContent>
+      </Popover>
     </div>
   );
 }

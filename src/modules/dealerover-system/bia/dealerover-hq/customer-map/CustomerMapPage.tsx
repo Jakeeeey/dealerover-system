@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { RefreshCw } from "lucide-react";
+import { Maximize2, Minimize2, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { ErrorPage } from "@/app/(dealerover-system)/dealerover-system/_components/ErrorPage";
@@ -16,11 +16,13 @@ import {
 } from "./types";
 import { useCustomerMap } from "./hooks/useCustomerMap";
 import { useBoundaryFeature, type BoundarySelection } from "./hooks/useBoundaryFeature";
+import { useFullscreen } from "./hooks/useFullscreen";
 import { CustomerMapFilters } from "./components/CustomerMapFilters";
 import { CustomerMapSidebar } from "./components/CustomerMapSidebar";
 import { MapStyleSwitch } from "./components/MapStyleSwitch";
 import { CustomerMapSkeleton } from "./components/CustomerMapSkeleton";
 import { CustomerMapView } from "./components/CustomerMapView";
+import { MapStageContext } from "./components/MapStageContext";
 import { getDealerColor } from "./utils/dealer-colors";
 
 const MARKER_STORAGE_KEY = "hq-customer-map-marker";
@@ -37,6 +39,8 @@ function uniqueSorted(values: string[]): string[] {
 
 export default function CustomerMapPage() {
   const { data, isLoading, error, refresh } = useCustomerMap();
+  const [stageEl, setStageEl] = React.useState<HTMLDivElement | null>(null);
+  const { isFullscreen, toggle: toggleFullscreen } = useFullscreen<HTMLDivElement>(stageEl);
   const [filters, setFilters] = React.useState<CustomerMapFilterState>({
     ...EMPTY_CUSTOMER_MAP_FILTERS,
   });
@@ -280,7 +284,8 @@ export default function CustomerMapPage() {
   // sidebar+toolbar 20 · detail card 30). The route breadcrumb already labels
   // this view, so only an sr-only heading remains for assistive tech.
   return (
-    <div className="relative min-h-0 flex-1 overflow-hidden">
+    <div ref={setStageEl} className="relative min-h-0 flex-1 overflow-hidden bg-background">
+      <MapStageContext.Provider value={stageEl}>
       <h1 className="sr-only">Customer Map</h1>
 
       <CustomerMapView
@@ -315,6 +320,17 @@ export default function CustomerMapPage() {
           <RefreshCw className={cn("size-4", isLoading && "animate-spin")} />
           <span className="hidden sm:inline">Refresh</span>
         </Button>
+        <Button
+          variant="outline"
+          size="icon"
+          onClick={toggleFullscreen}
+          className="size-9 shrink-0"
+          title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+          aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+          aria-pressed={isFullscreen}
+        >
+          {isFullscreen ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
+        </Button>
       </div>
 
       {/* Floating filter panel overlaid inside the map (desktop). */}
@@ -327,6 +343,7 @@ export default function CustomerMapPage() {
       <div className="absolute left-3 top-[4.75rem] z-20 lg:hidden">
         <CustomerMapFilters {...filterProps} />
       </div>
+      </MapStageContext.Provider>
     </div>
   );
 }

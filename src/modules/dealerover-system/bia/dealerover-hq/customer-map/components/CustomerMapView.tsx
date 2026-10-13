@@ -9,7 +9,8 @@ import type {
   Map as MapLibreMap,
   MapMouseEvent,
 } from "maplibre-gl";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Popover, PopoverTrigger } from "@/components/ui/popover";
+import { PopoverStageContent } from "./PopoverStageContent";
 import { cn, formatNumber } from "@/lib/utils";
 import type {
   CustomerMapBasemap,
@@ -958,7 +959,7 @@ export function CustomerMapView({
                         +{overflowCount}
                       </button>
                     </PopoverTrigger>
-                    <PopoverContent side="top" align="center" className="w-[260px] p-1">
+                    <PopoverStageContent side="top" align="center" className="w-[260px] p-1">
                       <ul className="max-h-64 overflow-y-auto overscroll-contain">
                         {dealers.map((dealer) => (
                           <li key={dealer.id}>
@@ -972,7 +973,7 @@ export function CustomerMapView({
                           </li>
                         ))}
                       </ul>
-                    </PopoverContent>
+                    </PopoverStageContent>
                   </Popover>
                 )}
               </>
