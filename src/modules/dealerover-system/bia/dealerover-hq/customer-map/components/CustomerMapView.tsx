@@ -22,15 +22,35 @@ const SOURCE_ID = "customer-points";
 const HEAT_ID = "customer-heat";
 const CIRCLE_ID = "customer-points-circle";
 
-// Boundary highlight (selected province/city/barangay): a dim mask with the
-// selection cut out as holes, a subtle tint over the selection, and a
-// two-pass glow border. Rebuilt in `applyLayers` so basemap swaps keep them.
+// Boundary highlight (selected province/city/barangay): a dark dim mask with
+// the selection cut out as holes, an accent tint over the selection, and a
+// multi-pass neon glow border (blurred halo stack + bright white core).
+// Geometry is corner-cut (Chaikin) so the generalized source polygons read as
+// smooth curves instead of angular segments. Rebuilt in `applyLayers` so
+// basemap swaps keep them.
 const BOUNDARY_SOURCE_ID = "boundary-highlight";
 const DIM_SOURCE_ID = "boundary-dim-mask";
 const DIM_ID = "boundary-dim";
 const TINT_ID = "boundary-tint";
-const HALO_ID = "boundary-halo";
+const GLOW_FAR_ID = "boundary-glow-far";
+const GLOW_MID_ID = "boundary-glow-mid";
+const GLOW_NEAR_ID = "boundary-glow-near";
 const LINE_ID = "boundary-line";
+const CORE_ID = "boundary-core";
+const BOUNDARY_LAYER_IDS = [
+  DIM_ID,
+  TINT_ID,
+  GLOW_FAR_ID,
+  GLOW_MID_ID,
+  GLOW_NEAR_ID,
+  LINE_ID,
+  CORE_ID,
+];
+const BOUNDARY_SOURCE_IDS = [BOUNDARY_SOURCE_ID, DIM_SOURCE_ID];
+
+/** Chaikin corner-cutting passes applied to the highlight rings (0 = off; the
+ * geoBoundaries shapes are already detailed, so no cosmetic smoothing). */
+const BOUNDARY_SMOOTHING_ITERATIONS = 0;
 
 /** Loose GeoJSON boundary payload served by the boundary API route. */
 export interface BoundaryHighlightGeometry {
@@ -195,13 +215,61 @@ function exteriorRings(highlight: BoundaryHighlight): Ring[] {
   return rings;
 }
 
+/** Chaikin corner-cutting on a closed ring — softens the angular, generalized
+ * source boundaries into smooth curves. Two passes is a good visual balance. */
+function chaikinClosed(ring: Ring, iterations: number): Ring {
+  let pts = ring.slice();
+  if (
+    pts.length > 1 &&
+    pts[0][0] === pts[pts.length - 1][0] &&
+    pts[0][1] === pts[pts.length - 1][1]
+  ) {
+    pts.pop();
+  }
+  for (let pass = 0; pass < iterations && pts.length >= 3; pass += 1) {
+    const out: Ring = [];
+    for (let i = 0; i < pts.length; i += 1) {
+      const a = pts[i];
+      const b = pts[(i + 1) % pts.length];
+      out.push([a[0] + (b[0] - a[0]) * 0.25, a[1] + (b[1] - a[1]) * 0.25]);
+      out.push([a[0] + (b[0] - a[0]) * 0.75, a[1] + (b[1] - a[1]) * 0.75]);
+    }
+    pts = out;
+  }
+  pts.push(pts[0]); // re-close the ring
+  return pts;
+}
+
+/** Smoothed exterior rings of the selection (Polygon + MultiPolygon). */
+function smoothedExteriorRings(highlight: BoundaryHighlight): Ring[] {
+  return exteriorRings(highlight).map((ring) =>
+    BOUNDARY_SMOOTHING_ITERATIONS > 0
+      ? chaikinClosed(ring, BOUNDARY_SMOOTHING_ITERATIONS)
+      : ring,
+  );
+}
+
+/** Rebuilds the selection as smoothed polygons for the tint + glow layers. */
+function buildSmoothedHighlight(highlight: BoundaryHighlight): MappableData | null {
+  const rings = smoothedExteriorRings(highlight);
+  if (rings.length === 0) return null;
+  return {
+    type: "FeatureCollection",
+    features: rings.map((ring) => ({
+      type: "Feature",
+      properties: {},
+      geometry: { type: "Polygon", coordinates: [ring] },
+    })),
+  } as unknown as MappableData;
+}
+
 /**
- * Builds the dim mask: a world-sized exterior with the selection's exterior
- * rings cut out as (clockwise) holes, so everything OUTSIDE the selection is
- * washed while the selection itself stays bright.
+ * Builds the dim mask: a world-sized exterior with the (smoothed) selection
+ * exterior rings cut out as clockwise holes, so everything OUTSIDE the
+ * selection is washed while the selection itself stays bright.
  */
 function buildDimMask(highlight: BoundaryHighlight): MappableData | null {
-  const holes = exteriorRings(highlight);
+  const holes = smoothedExteriorRings(highlight);
   if (holes.length === 0) return null;
   const world: Ring = [
     [-180, -90],
@@ -281,25 +349,28 @@ function resolveAccentColor(): string {
 }
 
 /**
- * (Re)builds the boundary highlight layers: dim mask (world wash with the
- * selection cut out), subtle tint over the selection, and a two-pass glow
- * border (wide blurred halo + crisp inner line). Removes everything when the
- * highlight is null/empty. Layer order is enforced bottom-to-top so the dim
- * wash never covers the customer points.
+ * (Re)builds the boundary highlight layers: a dark dim mask (world wash with
+ * the smoothed selection cut out), an accent tint over the selection, and a
+ * multi-pass neon border (blurred halo stack + bright white core). Removes
+ * everything when the highlight is null/empty. Layer order is enforced
+ * bottom-to-top so the dim wash never covers the customer points.
  * @param {MapLibreMap} map - Live MapLibre instance.
  * @param {BoundaryHighlight | null} highlight - Selected boundary, if any.
  */
 function applyBoundaryLayers(map: MapLibreMap, highlight: BoundaryHighlight | null): void {
-  const mask = highlight && highlight.features.length > 0 ? buildDimMask(highlight) : null;
-  if (!mask || !highlight) {
-    for (const id of [LINE_ID, HALO_ID, TINT_ID, DIM_ID]) {
+  const hasSelection = Boolean(highlight && highlight.features.length > 0);
+  const boundaryData = hasSelection && highlight ? buildSmoothedHighlight(highlight) : null;
+  const mask = hasSelection && highlight ? buildDimMask(highlight) : null;
+
+  if (!boundaryData || !mask) {
+    for (const id of BOUNDARY_LAYER_IDS) {
       try {
         if (map.getLayer(id)) map.removeLayer(id);
       } catch {
         // Layer already gone with a style swap — nothing to do.
       }
     }
-    for (const source of [BOUNDARY_SOURCE_ID, DIM_SOURCE_ID]) {
+    for (const source of BOUNDARY_SOURCE_IDS) {
       try {
         if (map.getSource(source)) map.removeSource(source);
       } catch {
@@ -309,7 +380,6 @@ function applyBoundaryLayers(map: MapLibreMap, highlight: BoundaryHighlight | nu
     return;
   }
 
-  const boundaryData = highlight as unknown as MappableData;
   const existingBoundary = map.getSource(BOUNDARY_SOURCE_ID) as GeoJSONSource | undefined;
   if (!existingBoundary) map.addSource(BOUNDARY_SOURCE_ID, { type: "geojson", data: boundaryData });
   else existingBoundary.setData(boundaryData);
@@ -318,12 +388,17 @@ function applyBoundaryLayers(map: MapLibreMap, highlight: BoundaryHighlight | nu
   if (!existingDim) map.addSource(DIM_SOURCE_ID, { type: "geojson", data: mask });
   else existingDim.setData(mask);
 
+  // Canvas paints (see resolveAccentColor) — re-read every apply so a
+  // light/dark flip re-tones the glow without a basemap swap.
+  const accent = resolveAccentColor();
+
   if (!map.getLayer(DIM_ID)) {
     map.addLayer({
       id: DIM_ID,
       type: "fill",
       source: DIM_SOURCE_ID,
-      paint: { "fill-color": "#000000", "fill-opacity": 0.45 },
+      // Near-black wash so everything outside the selection is heavily darkened.
+      paint: { "fill-color": "#000000", "fill-opacity": 0.85 },
     });
   }
   if (!map.getLayer(TINT_ID)) {
@@ -331,43 +406,78 @@ function applyBoundaryLayers(map: MapLibreMap, highlight: BoundaryHighlight | nu
       id: TINT_ID,
       type: "fill",
       source: BOUNDARY_SOURCE_ID,
-      paint: { "fill-color": "#ffffff", "fill-opacity": 0.12 },
+      paint: { "fill-color": accent, "fill-opacity": 0.1 },
     });
   }
+  if (map.getLayer(TINT_ID)) map.setPaintProperty(TINT_ID, "fill-color", accent);
 
-  // Canvas paints (see resolveAccentColor) — re-read every apply so a
-  // light/dark flip re-tones the glow without a basemap swap.
-  const accent = resolveAccentColor();
-  if (!map.getLayer(HALO_ID)) {
-    map.addLayer({
-      id: HALO_ID,
-      type: "line",
-      source: BOUNDARY_SOURCE_ID,
-      paint: {
-        "line-color": accent,
-        "line-width": 10,
-        "line-blur": 8,
-        "line-opacity": 0.5,
-      },
-    });
-  }
+  const glow = (id: string, width: number, blur: number, opacity: number) => {
+    if (!map.getLayer(id)) {
+      map.addLayer({
+        id,
+        type: "line",
+        source: BOUNDARY_SOURCE_ID,
+        layout: { "line-join": "round", "line-cap": "round" },
+        paint: {
+          "line-color": accent,
+          "line-width": width,
+          "line-blur": blur,
+          "line-opacity": opacity,
+        },
+      });
+      return;
+    }
+    map.setPaintProperty(id, "line-color", accent);
+    map.setPaintProperty(id, "line-width", width);
+    map.setPaintProperty(id, "line-blur", blur);
+    map.setPaintProperty(id, "line-opacity", opacity);
+  };
+
+  // Neon halo: far → near, growing brightness.
+  glow(GLOW_FAR_ID, 34, 20, 0.45);
+  glow(GLOW_MID_ID, 20, 12, 0.65);
+  glow(GLOW_NEAR_ID, 11, 5, 0.9);
+
   if (!map.getLayer(LINE_ID)) {
     map.addLayer({
       id: LINE_ID,
       type: "line",
       source: BOUNDARY_SOURCE_ID,
+      layout: { "line-join": "round", "line-cap": "round" },
+      paint: { "line-color": accent, "line-width": 4.5, "line-opacity": 1 },
+    });
+  } else {
+    map.setPaintProperty(LINE_ID, "line-color", accent);
+  }
+
+  // White-hot core — the neon tube.
+  if (!map.getLayer(CORE_ID)) {
+    map.addLayer({
+      id: CORE_ID,
+      type: "line",
+      source: BOUNDARY_SOURCE_ID,
+      layout: { "line-join": "round", "line-cap": "round" },
       paint: {
-        "line-color": accent,
-        "line-width": 2.5,
-        "line-opacity": 1,
+        "line-color": "#ffffff",
+        "line-width": 1.8,
+        "line-blur": 0.3,
+        "line-opacity": 0.95,
       },
     });
   }
-  if (map.getLayer(HALO_ID)) map.setPaintProperty(HALO_ID, "line-color", accent);
-  if (map.getLayer(LINE_ID)) map.setPaintProperty(LINE_ID, "line-color", accent);
 
   // Enforce bottom-to-top stacking: dim + tint under the points, glow above.
-  for (const id of [DIM_ID, TINT_ID, HEAT_ID, CIRCLE_ID, HALO_ID, LINE_ID]) {
+  for (const id of [
+    DIM_ID,
+    TINT_ID,
+    HEAT_ID,
+    CIRCLE_ID,
+    GLOW_FAR_ID,
+    GLOW_MID_ID,
+    GLOW_NEAR_ID,
+    LINE_ID,
+    CORE_ID,
+  ]) {
     try {
       if (map.getLayer(id)) map.moveLayer(id);
     } catch {

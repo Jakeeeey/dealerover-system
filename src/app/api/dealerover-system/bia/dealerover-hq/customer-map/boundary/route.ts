@@ -6,7 +6,8 @@ import {
   type BoundaryLevel,
 } from "@/modules/dealerover-system/bia/dealerover-hq/customer-map/services/boundaries-service";
 
-// Boundary geometries: bettergov.ph / barangay-boundaries-repository v2026.4.13.0 (PSGC).
+// Boundary geometries: HDX COD-AB (PSA / NAMRIA) via free ArcGIS REST mirrors,
+// simplified to ~22 m (maxAllowableOffset 0.0002).
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";

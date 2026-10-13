@@ -1,10 +1,26 @@
 /**
  * Server-only PSGC boundary index for the HQ customer map.
  *
- * Boundary geometries: bettergov.ph / barangay-boundaries-repository
- * v2026.4.13.0 (PSGC). Loaded from `public/geojson/` once per server
- * instance and indexed with a bbox + coarse-grid prefilter so per-customer
- * point-in-polygon lookups stay cheap at request time.
+ * Data source: HDX COD-AB mirror of PSA/NAMRIA boundaries via ArcGIS
+ * (geometry simplified at ~22 m tolerance; coordinates rounded to 5dp).
+ *
+ * Level -> file mapping under `public/geojson/`:
+ *   - province -> `provinces.geojson` (88 features; loaded eagerly).
+ *   - city -> `cities.geojson` (1,647 features; loaded eagerly).
+ *   - barangay -> `barangays/<idx>.geojson` (88 files, one per province,
+ *     where `<idx>` is the 0-based index into the provinces feature order;
+ *     loaded lazily, never all at once).
+ *   - `barangays-index.json` is a compact manifest of parallel arrays
+ *     `{ province: number[], name: string[], city: string[] }` (~1.2 MB)
+ *     loaded once at startup so a barangay's province file can be located
+ *     without reading all 88 files.
+ *
+ * Memory strategy: provinces + cities are loaded eagerly and indexed once
+ * per server instance (bbox + 0.05-degree coarse-grid prefilter, so
+ * per-customer point-in-polygon lookups stay cheap at request time).
+ * Barangays are NEVER globally indexed (44,947 features would pin RAM):
+ * each province file is read, parsed, and indexed on demand and held in a
+ * small LRU (the last ~6 provinces), so server RAM stays bounded.
  *
  * Why this exists: dealer customer rows carry empty PSGC text columns, so
  * province/city/barangay are derived server-side from each customer's
@@ -57,22 +73,42 @@ interface IndexedLevel {
   features: BoundaryFeature[];
   bboxes: (BBox | null)[];
   grid: Map<string, number[]>;
-  /** Barangay-only: city name -> feature indices inside that city. */
-  byCityName: Map<string, number[]>;
+}
+
+/** Compact manifest entry: which province file a barangay lives in. */
+interface BarangayManifest {
+  /** Normalized barangay name -> province file indices holding that name. */
+  nameToProvinces: Map<string, number[]>;
+  /** Normalized `name|city` -> province file indices (city-narrowed lookup). */
+  nameCityToProvinces: Map<string, number[]>;
 }
 
 /** Coarse-grid cell size in degrees. Small enough to prune, big enough to stay lean. */
 const CELL_SIZE = 0.05;
 
-const GEO_FILES: Record<BoundaryLevel, string> = {
+/** Eagerly loaded levels: provinces + cities are small enough to index globally. */
+const EAGER_FILES: Record<"province" | "city", string> = {
   province: "provinces.geojson",
   city: "cities.geojson",
-  barangay: "barangays.geojson",
 };
+
+const BARANGAY_MANIFEST_FILE = "barangays-index.json";
+
+/** Barangay province files kept in memory; older entries are evicted first. */
+const MAX_CACHED_BARANGAY_PROVINCES = 6;
 
 function featureName(feature: BoundaryFeature): string {
   const name = feature.properties?.name;
   return typeof name === "string" ? name : "";
+}
+
+/**
+ * Normalizes a boundary name for manifest keys and soft city matching.
+ * @param {string} value - Raw boundary or city name.
+ * @returns {string} Lower-cased, whitespace-collapsed name.
+ */
+function normalizeName(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
 function isNumberPair(value: unknown): value is [number, number] {
@@ -128,7 +164,6 @@ function cellKey(cx: number, cy: number): string {
 function buildIndex(features: BoundaryFeature[]): IndexedLevel {
   const bboxes: (BBox | null)[] = new Array(features.length).fill(null);
   const grid = new Map<string, number[]>();
-  const byCityName = new Map<string, number[]>();
 
   features.forEach((feature, index) => {
     const bbox = bboxOf(feature);
@@ -146,56 +181,207 @@ function buildIndex(features: BoundaryFeature[]): IndexedLevel {
         else grid.set(key, [index]);
       }
     }
-    const city = feature.properties?.city;
-    if (typeof city === "string" && city) {
-      const list = byCityName.get(city);
-      if (list) list.push(index);
-      else byCityName.set(city, [index]);
-    }
   });
 
-  return { features, bboxes, grid, byCityName };
+  return { features, bboxes, grid };
 }
 
 /**
- * Reads one boundary file from `public/geojson`.
- * @param {BoundaryLevel} level - Which boundary level to load.
+ * Narrows a raw GeoJSON `features` value to valid boundary features.
+ * @param {unknown} entries - Raw `features` array from a parsed file.
+ * @returns {BoundaryFeature[]} Valid features (invalid entries dropped).
+ */
+function toBoundaryFeatures(entries: unknown): BoundaryFeature[] {
+  if (!Array.isArray(entries)) return [];
+  return entries.filter(
+    (feature): feature is BoundaryFeature =>
+      typeof feature === "object" &&
+      feature !== null &&
+      (feature as { type?: unknown }).type === "Feature" &&
+      typeof (feature as { geometry?: unknown }).geometry === "object",
+  );
+}
+
+/**
+ * Reads one eagerly loaded boundary file from `public/geojson`.
+ * @param {"province" | "city"} level - Which eager level to load.
  * @returns {BoundaryFeature[]} Parsed features (empty on any failure).
  */
-function loadFeatures(level: BoundaryLevel): BoundaryFeature[] {
+function loadEagerFeatures(level: "province" | "city"): BoundaryFeature[] {
   try {
-    const file = path.join(process.cwd(), "public", "geojson", GEO_FILES[level]);
+    const file = path.join(process.cwd(), "public", "geojson", EAGER_FILES[level]);
     const raw = fs.readFileSync(file, "utf8");
     const parsed = JSON.parse(raw) as { features?: unknown };
     if (!parsed || !Array.isArray(parsed.features)) return [];
-    return parsed.features.filter(
-      (feature): feature is BoundaryFeature =>
-        typeof feature === "object" &&
-        feature !== null &&
-        (feature as { type?: unknown }).type === "Feature" &&
-        typeof (feature as { geometry?: unknown }).geometry === "object",
-    );
+    return toBoundaryFeatures(parsed.features);
   } catch (error) {
-    console.error(`ERR_INTERNAL_FAIL: [Boundaries] Failed to load ${GEO_FILES[level]}:`, error);
+    console.error(`ERR_INTERNAL_FAIL: [Boundaries] Failed to load ${EAGER_FILES[level]}:`, error);
     return [];
   }
 }
 
-let cache: Record<BoundaryLevel, IndexedLevel> | null = null;
+let eagerCache: Record<"province" | "city", IndexedLevel> | null = null;
 
 /**
- * Lazily loads + indexes all three boundary levels once per server instance.
- * @returns {Record<BoundaryLevel, IndexedLevel>} Cached indexes.
+ * Lazily loads + indexes the eager levels (provinces + cities) once per server instance.
+ * @returns {Record<"province" | "city", IndexedLevel>} Cached eager indexes.
  */
-function getIndexes(): Record<BoundaryLevel, IndexedLevel> {
-  if (!cache) {
-    cache = {
-      province: buildIndex(loadFeatures("province")),
-      city: buildIndex(loadFeatures("city")),
-      barangay: buildIndex(loadFeatures("barangay")),
+function getEagerIndexes(): Record<"province" | "city", IndexedLevel> {
+  if (!eagerCache) {
+    eagerCache = {
+      province: buildIndex(loadEagerFeatures("province")),
+      city: buildIndex(loadEagerFeatures("city")),
     };
   }
-  return cache;
+  return eagerCache;
+}
+
+/**
+ * Appends a province index to a manifest bucket, keeping entries unique.
+ * @param {Map<string, number[]>} target - Manifest map under construction.
+ * @param {string} key - Normalized lookup key.
+ * @param {number} provinceIndex - Province file index to record.
+ */
+function pushManifestEntry(
+  target: Map<string, number[]>,
+  key: string,
+  provinceIndex: number,
+): void {
+  const list = target.get(key);
+  if (list) {
+    if (!list.includes(provinceIndex)) list.push(provinceIndex);
+  } else {
+    target.set(key, [provinceIndex]);
+  }
+}
+
+let manifestCache: BarangayManifest | null = null;
+
+/**
+ * Loads the compact barangay manifest (`barangays-index.json` parallel arrays)
+ * into normalized name -> province-index maps. Cheap (~1.2 MB) and read once.
+ * @returns {BarangayManifest} Lookup maps (empty on any failure).
+ */
+function getBarangayManifest(): BarangayManifest {
+  if (manifestCache) return manifestCache;
+  const empty: BarangayManifest = { nameToProvinces: new Map(), nameCityToProvinces: new Map() };
+  try {
+    const file = path.join(process.cwd(), "public", "geojson", BARANGAY_MANIFEST_FILE);
+    const raw = fs.readFileSync(file, "utf8");
+    const parsed = JSON.parse(raw) as {
+      province?: unknown;
+      name?: unknown;
+      city?: unknown;
+    };
+    if (
+      !parsed ||
+      !Array.isArray(parsed.province) ||
+      !Array.isArray(parsed.name) ||
+      !Array.isArray(parsed.city) ||
+      parsed.province.length !== parsed.name.length ||
+      parsed.province.length !== parsed.city.length
+    ) {
+      console.error(
+        `ERR_INTERNAL_FAIL: [Boundaries] ${BARANGAY_MANIFEST_FILE} has mismatched parallel arrays`,
+      );
+      manifestCache = empty;
+      return manifestCache;
+    }
+    const provinces = parsed.province;
+    const names = parsed.name;
+    const cities = parsed.city;
+    for (let i = 0; i < provinces.length; i += 1) {
+      const provinceIndex = provinces[i];
+      const name = names[i];
+      const city = cities[i];
+      if (
+        typeof provinceIndex !== "number" ||
+        !Number.isInteger(provinceIndex) ||
+        provinceIndex < 0 ||
+        typeof name !== "string" ||
+        typeof city !== "string"
+      ) {
+        continue;
+      }
+      const normName = normalizeName(name);
+      if (!normName) continue;
+      pushManifestEntry(empty.nameToProvinces, normName, provinceIndex);
+      const normCity = normalizeName(city);
+      if (normCity) {
+        pushManifestEntry(empty.nameCityToProvinces, `${normName}|${normCity}`, provinceIndex);
+      }
+    }
+    for (const list of empty.nameToProvinces.values()) list.sort((a, b) => a - b);
+    for (const list of empty.nameCityToProvinces.values()) list.sort((a, b) => a - b);
+  } catch (error) {
+    console.error(
+      `ERR_INTERNAL_FAIL: [Boundaries] Failed to load ${BARANGAY_MANIFEST_FILE}:`,
+      error,
+    );
+    manifestCache = empty;
+    return manifestCache;
+  }
+  manifestCache = empty;
+  return manifestCache;
+}
+
+/** LRU of per-province barangay indexes: province file index -> indexed level. */
+const barangayCache = new Map<number, IndexedLevel>();
+
+/**
+ * Reads + indexes one province's barangay file on demand, LRU-cached so RAM
+ * stays bounded to the last few provinces touched.
+ * @param {number} provinceIndex - 0-based index into the provinces feature order.
+ * @returns {IndexedLevel | null} Indexed barangays, or null when unreadable.
+ */
+function getProvinceBarangays(provinceIndex: number): IndexedLevel | null {
+  if (!Number.isInteger(provinceIndex) || provinceIndex < 0) return null;
+  const cached = barangayCache.get(provinceIndex);
+  if (cached) {
+    barangayCache.delete(provinceIndex);
+    barangayCache.set(provinceIndex, cached);
+    return cached;
+  }
+  const provinceCount = getEagerIndexes().province.features.length;
+  if (provinceIndex >= provinceCount) {
+    console.error(
+      `ERR_INTERNAL_FAIL: [Boundaries] Barangay province index ${provinceIndex} out of range (0..${provinceCount - 1})`,
+    );
+    return null;
+  }
+  let features: BoundaryFeature[];
+  try {
+    const file = path.join(
+      process.cwd(),
+      "public",
+      "geojson",
+      "barangays",
+      `${provinceIndex}.geojson`,
+    );
+    const raw = fs.readFileSync(file, "utf8");
+    const parsed = JSON.parse(raw) as { features?: unknown };
+    if (!parsed || !Array.isArray(parsed.features)) {
+      console.error(
+        `ERR_INTERNAL_FAIL: [Boundaries] barangays/${provinceIndex}.geojson has no features array`,
+      );
+      return null;
+    }
+    features = toBoundaryFeatures(parsed.features);
+  } catch (error) {
+    console.error(
+      `ERR_INTERNAL_FAIL: [Boundaries] Failed to load barangays/${provinceIndex}.geojson:`,
+      error,
+    );
+    return null;
+  }
+  const indexed = buildIndex(features);
+  barangayCache.set(provinceIndex, indexed);
+  while (barangayCache.size > MAX_CACHED_BARANGAY_PROVINCES) {
+    const oldest = barangayCache.keys().next();
+    if (oldest.done) break;
+    barangayCache.delete(oldest.value);
+  }
+  return indexed;
 }
 
 /**
@@ -269,20 +455,20 @@ function bboxHits(bbox: BBox | null, lng: number, lat: number): boolean {
  * @param {number[]} candidates - Grid-prefiltered feature indices.
  * @param {number} lng - Point longitude.
  * @param {number} lat - Point latitude.
- * @returns {BoundaryFeature | null} Containing feature, if any.
+ * @returns {number} Containing feature index, or -1 when none contains the point.
  */
-function findContaining(
+function findContainingIndex(
   level: IndexedLevel,
   candidates: number[],
   lng: number,
   lat: number,
-): BoundaryFeature | null {
+): number {
   for (const index of candidates) {
     if (!bboxHits(level.bboxes[index], lng, lat)) continue;
     const feature = level.features[index];
-    if (geometryContains(feature.geometry, lng, lat)) return feature;
+    if (geometryContains(feature.geometry, lng, lat)) return index;
   }
-  return null;
+  return -1;
 }
 
 function gridCandidates(level: IndexedLevel, lng: number, lat: number): number[] {
@@ -291,7 +477,8 @@ function gridCandidates(level: IndexedLevel, lng: number, lat: number): number[]
 
 /**
  * Resolves province/city/barangay names for a coordinate pair.
- * Barangay scanning is scoped to the matched city's features for speed.
+ * The barangay scan is scoped to the PIP-matched province's file (loaded on
+ * demand into the LRU); a missing province or unreadable file yields brgy null.
  * @param {number} lng - Point longitude.
  * @param {number} lat - Point latitude.
  * @returns {AdminResolution} Resolved names (null when outside every polygon).
@@ -301,49 +488,53 @@ export function resolveAdmin(lng: number, lat: number): AdminResolution {
   if (!Number.isFinite(lng) || !Number.isFinite(lat)) return none;
   if (lng < -180 || lng > 180 || lat < -90 || lat > 90) return none;
 
-  const indexes = getIndexes();
+  const indexes = getEagerIndexes();
 
-  const provinceFeature = findContaining(
+  const provinceIndex = findContainingIndex(
     indexes.province,
     gridCandidates(indexes.province, lng, lat),
     lng,
     lat,
   );
   // Independent cities (province: null) sit outside any province polygon, so a
-  // missing province must not block the city/barangay lookup below.
-  const province = provinceFeature ? featureName(provinceFeature) || null : null;
+  // missing province must not block the city lookup below (barangay still
+  // needs a province file, so it stays null in that case).
+  const province =
+    provinceIndex >= 0 ? featureName(indexes.province.features[provinceIndex]) || null : null;
 
-  const cityFeature = findContaining(
+  const cityIndex = findContainingIndex(
     indexes.city,
     gridCandidates(indexes.city, lng, lat),
     lng,
     lat,
   );
-  if (!cityFeature) return { ...none, province };
-  const city = featureName(cityFeature) || null;
+  if (cityIndex < 0) return { ...none, province };
+  const city = featureName(indexes.city.features[cityIndex]) || null;
   if (!city) return { ...none, province };
 
-  // Barangay polygons are disjoint, so scanning only the matched city's
-  // barangays is exact and keeps per-row work to ~dozens of polygons.
-  const scoped = indexes.barangay.byCityName.get(city) ?? [];
-  let brgy: string | null = null;
-  if (scoped.length > 0) {
-    const barangays = indexes.barangay;
-    for (const index of scoped) {
-      if (!bboxHits(barangays.bboxes[index], lng, lat)) continue;
-      const feature = barangays.features[index];
-      if (geometryContains(feature.geometry, lng, lat)) {
-        brgy = featureName(feature) || null;
-        break;
-      }
-    }
-  }
+  if (provinceIndex < 0) return { ...none, province, city };
+  const barangays = getProvinceBarangays(provinceIndex);
+  if (!barangays) return { province, city, brgy: null };
 
-  return { province, city, brgy };
+  // Barangay polygons are disjoint, so the grid-prefiltered candidates are
+  // exact and cheap — scoped by geometry (not by city name).
+  const brgyIndex = findContainingIndex(
+    barangays,
+    gridCandidates(barangays, lng, lat),
+    lng,
+    lat,
+  );
+  return {
+    province,
+    city,
+    brgy: brgyIndex >= 0 ? featureName(barangays.features[brgyIndex]) || null : null,
+  };
 }
 
 /**
  * Returns the boundary feature(s) matching a name for highlight rendering.
+ * Provinces/cities match against the eager indexes; barangays use the
+ * manifest to load only the province file(s) that hold the name.
  * @param {BoundaryLevel} level - Which boundary level to search.
  * @param {string} name - Exact feature name (e.g. a resolved province/city).
  * @param {string} [city] - Optional parent city to disambiguate barangay names.
@@ -359,12 +550,49 @@ export function getBoundary(
   if ((level !== "province" && level !== "city" && level !== "barangay") || !wanted) {
     return empty;
   }
+  if (level === "province" || level === "city") {
+    const { features } = getEagerIndexes()[level];
+    return {
+      type: "FeatureCollection",
+      features: features.filter((feature) => featureName(feature) === wanted),
+    };
+  }
+
+  // Barangay: the manifest says which province file(s) hold this name, so only
+  // those files are read (through the LRU) instead of scanning all 88.
   const wantedCity = city?.trim() ?? "";
-  const { features } = getIndexes()[level];
-  const matches = features.filter((feature) => {
-    if (featureName(feature) !== wanted) return false;
-    if (level === "barangay" && wantedCity && feature.properties?.city !== wantedCity) return false;
-    return true;
-  });
+  const manifest = getBarangayManifest();
+  const normName = normalizeName(wanted);
+  const normCity = normalizeName(wantedCity);
+  if (!normName) return empty;
+  let candidateIndices: number[];
+  if (normCity) {
+    const scoped = manifest.nameCityToProvinces.get(`${normName}|${normCity}`);
+    candidateIndices =
+      scoped && scoped.length > 0
+        ? [...scoped]
+        : [...(manifest.nameToProvinces.get(normName) ?? [])];
+  } else {
+    candidateIndices = [...(manifest.nameToProvinces.get(normName) ?? [])];
+  }
+  if (candidateIndices.length === 0) return empty;
+
+  const matches: BoundaryFeature[] = [];
+  for (const provinceIndex of candidateIndices) {
+    const barangays = getProvinceBarangays(provinceIndex);
+    if (!barangays) continue;
+    for (const feature of barangays.features) {
+      if (normalizeName(featureName(feature)) === normName) matches.push(feature);
+    }
+  }
+  if (normCity) {
+    // City names differ between the province/city source and the barangay
+    // source, so treat the city as a soft hint: prefer a scoped match, but fall
+    // back to every same-named barangay rather than returning nothing.
+    const scoped = matches.filter(
+      (feature) => normalizeName(feature.properties?.city ?? "") === normCity,
+    );
+    return { type: "FeatureCollection", features: scoped.length > 0 ? scoped : matches };
+  }
   return { type: "FeatureCollection", features: matches };
 }
