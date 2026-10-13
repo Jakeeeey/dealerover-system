@@ -613,7 +613,7 @@ export function CustomerMapView({
       mapRef.current = instance;
       appliedBasemapRef.current = initialBasemapRef.current;
 
-      instance.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+      instance.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
       instance.addControl(new maplibregl.ScaleControl({ maxWidth: 100 }), "bottom-left");
 
       // Generic handlers survive style swaps (layer-bound handlers do not).
@@ -708,10 +708,24 @@ export function CustomerMapView({
     }
   }, [customers, mapReady]);
 
+  // Full-bleed stage: the map is the base layer (z-0) and every strip is a
+  // floating glass overlay — offline pill top-center (z-10), legend pill
+  // bottom-center (z-10), empty/loading centered (z-10), detail card offset
+  // below the top-right toolbar (z-30). The page owns the higher zones
+  // (sidebar + toolbar at z-20).
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div className="absolute inset-0 bg-muted">
+      <div className="absolute inset-0">
+        <div
+          ref={containerRef}
+          className="h-full w-full"
+          role="region"
+          aria-label="Customer location map"
+        />
+      </div>
+
       {offlineDealers.length > 0 && (
-        <div className="flex shrink-0 items-center gap-2 border-b border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        <div className="absolute left-1/2 top-3 z-10 flex max-w-[calc(100%-1.5rem)] -translate-x-1/2 items-center gap-2 rounded-full border border-destructive/30 bg-card/85 py-1.5 pl-3 pr-3 text-xs text-destructive shadow-lg backdrop-blur-md">
           <CircleAlert className="size-4 shrink-0" aria-hidden />
           <span className="min-w-0 truncate" title={offlineDealers.map((d) => d.dealerName).join(", ")}>
             {offlineDealers.map((dealer) => dealer.dealerName).join(", ")}{" "}
@@ -720,37 +734,25 @@ export function CustomerMapView({
         </div>
       )}
 
-      <div className="relative min-h-0 flex-1 bg-muted">
-        {/* Maplibre adds `.maplibregl-map` (position: relative) to its container, which would
-            override `absolute`; wrap it so an inset-0 shell gives the map a definite height. */}
-        <div className="absolute inset-0">
-          <div
-            ref={containerRef}
-            className="h-full w-full"
-            role="region"
-            aria-label="Customer location map"
-          />
+      {!mapReady && (
+        <div className="absolute inset-0 z-10 flex items-center justify-center bg-muted">
+          <span className="text-sm text-muted-foreground">Loading map…</span>
         </div>
+      )}
 
-        {!mapReady && (
-          <div className="absolute inset-0 flex items-center justify-center bg-muted">
-            <span className="text-sm text-muted-foreground">Loading map…</span>
+      {mapReady && customers.length === 0 && (
+        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center p-4">
+          <div className="flex max-w-sm flex-col items-center gap-2 rounded-xl border border-border/60 bg-card/85 px-6 py-6 text-center shadow-lg backdrop-blur-md">
+            <MapPinOff className="size-8 text-muted-foreground" />
+            <p className="text-sm font-medium">No customers match the current filters.</p>
+            <p className="text-xs text-muted-foreground">Adjust the filters to widen the result set.</p>
           </div>
-        )}
+        </div>
+      )}
 
-        {mapReady && customers.length === 0 && (
-          <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-4">
-            <div className="flex max-w-sm flex-col items-center gap-2 rounded-xl border bg-card/95 px-6 py-6 text-center shadow-sm">
-              <MapPinOff className="size-8 text-muted-foreground" />
-              <p className="text-sm font-medium">No customers match the current filters.</p>
-              <p className="text-xs text-muted-foreground">Adjust the filters to widen the result set.</p>
-            </div>
-          </div>
-        )}
-
-        {selected && (
-          <div className="absolute left-3 top-3 z-10 w-[min(20rem,calc(100%-1.5rem))]">
-            <div className="rounded-xl border bg-card p-4 shadow-md">
+      {selected && (
+        <div className="absolute right-3 top-[4.5rem] z-30 w-[min(20rem,calc(100%-1.5rem))]">
+          <div className="rounded-xl border border-border/60 bg-card/85 p-4 shadow-lg backdrop-blur-md">
               <div className="flex items-start justify-between gap-3">
                 <div className="flex min-w-0 items-start gap-2">
                   <MapPin className="mt-0.5 size-4 shrink-0" style={{ color: selected.color }} />
@@ -770,8 +772,9 @@ export function CustomerMapView({
                 <button
                   type="button"
                   onClick={() => setSelected(null)}
-                  className="shrink-0 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  className="flex size-9 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
                   aria-label="Close customer details"
+                  title="Close customer details"
                 >
                   <X className="size-4" />
                 </button>
@@ -792,14 +795,14 @@ export function CustomerMapView({
             </div>
           </div>
         )}
-      </div>
 
-      {/* Dealer legend banner — scrolls horizontally so many dealers never wrap or eat map height. */}
-      <div className="flex shrink-0 items-center gap-3 overflow-x-auto border-t bg-card px-3 py-2">
+      {/* Dealer legend pill — floats bottom-center, scrolls horizontally so
+          many dealers never wrap or cover the map. */}
+      <div className="absolute bottom-3 left-1/2 z-10 flex max-w-[calc(100%-1.5rem)] -translate-x-1/2 items-center gap-3 overflow-x-auto rounded-xl border border-border/60 bg-card/85 px-3 py-2 shadow-lg backdrop-blur-md">
         <button
           type="button"
           onClick={() => setLegendOpen((open) => !open)}
-          className="shrink-0 whitespace-nowrap text-xs text-muted-foreground transition-colors hover:text-foreground"
+          className="flex min-h-9 shrink-0 items-center whitespace-nowrap text-xs text-muted-foreground transition-colors hover:text-foreground"
           title={legendOpen ? "Hide legend" : "Show legend"}
         >
           <span className="font-semibold tabular-nums text-foreground">

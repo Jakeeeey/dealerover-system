@@ -20,9 +20,9 @@ import {
 } from "./CustomerMapFilterFields";
 
 /**
- * Mobile filter presentation (`lg:hidden`, applies to every desktop layout): a
- * button that opens a full-height drawer, so filters are always one tap away
- * and the map keeps the viewport.
+ * Mobile filter presentation: a floating glass pill overlaid inside the map
+ * (rendered only below `lg` by the page) that opens a full-height drawer, so
+ * filters are always one tap away and the map keeps the viewport.
  */
 export function CustomerMapFilters(props: CustomerMapFilterProps) {
   const { onReset, resultCount, disabled = false } = props;
@@ -45,12 +45,12 @@ export function CustomerMapFilters(props: CustomerMapFilterProps) {
   );
 
   return (
-    <div className="flex shrink-0 items-center gap-2 lg:hidden">
+    <div className="flex items-center gap-2 rounded-xl border border-border/60 bg-card/85 px-2 py-1.5 shadow-lg backdrop-blur-md">
       <Sheet open={open} onOpenChange={setOpen}>
         <SheetTrigger asChild>
           <Button
             variant="outline"
-            className="h-10 min-w-0 flex-1 justify-between gap-2 text-sm font-normal"
+            className="h-9 w-auto min-w-0 justify-start gap-2 px-3 text-sm font-normal"
             disabled={disabled}
           >
             <span className="flex min-w-0 items-center gap-2">
@@ -93,7 +93,7 @@ export function CustomerMapFilters(props: CustomerMapFilterProps) {
       <Button
         variant="ghost"
         size="icon"
-        className="size-10 shrink-0"
+        className="size-9 shrink-0"
         onClick={onReset}
         disabled={disabled || activeCount === 0}
         aria-label="Reset filters"

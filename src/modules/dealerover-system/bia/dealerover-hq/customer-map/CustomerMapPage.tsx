@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { MapPinned, PanelLeft, RefreshCw, Rows3 } from "lucide-react";
+import { RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { ErrorPage } from "@/app/(dealerover-system)/dealerover-system/_components/ErrorPage";
@@ -17,16 +17,12 @@ import {
 import { useCustomerMap } from "./hooks/useCustomerMap";
 import { useBoundaryFeature, type BoundarySelection } from "./hooks/useBoundaryFeature";
 import { CustomerMapFilters } from "./components/CustomerMapFilters";
-import { CustomerMapToolbar } from "./components/CustomerMapToolbar";
 import { CustomerMapSidebar } from "./components/CustomerMapSidebar";
 import { MapStyleSwitch } from "./components/MapStyleSwitch";
 import { CustomerMapSkeleton } from "./components/CustomerMapSkeleton";
 import { CustomerMapView } from "./components/CustomerMapView";
 import { getDealerColor } from "./utils/dealer-colors";
 
-type DesktopLayout = "bar" | "sidebar";
-
-const LAYOUT_STORAGE_KEY = "hq-customer-map-layout";
 const MARKER_STORAGE_KEY = "hq-customer-map-marker";
 const BASEMAP_STORAGE_KEY = "hq-customer-map-basemap";
 
@@ -44,27 +40,6 @@ export default function CustomerMapPage() {
   const [filters, setFilters] = React.useState<CustomerMapFilterState>({
     ...EMPTY_CUSTOMER_MAP_FILTERS,
   });
-
-  // Filter-layout switch: "bar" (pinned toolbar above the map) or "sidebar"
-  // (vertical split rail). Kept as a first-class feature — the choice is
-  // remembered locally as the user's preference.
-  const [layout, setLayout] = React.useState<DesktopLayout>("sidebar");
-  React.useEffect(() => {
-    try {
-      const stored = localStorage.getItem(LAYOUT_STORAGE_KEY);
-      if (stored === "bar" || stored === "sidebar") setLayout(stored);
-    } catch {
-      // Ignore storage errors.
-    }
-  }, []);
-  const changeLayout = React.useCallback((next: DesktopLayout) => {
-    setLayout(next);
-    try {
-      localStorage.setItem(LAYOUT_STORAGE_KEY, next);
-    } catch {
-      // Ignore storage errors.
-    }
-  }, []);
 
   // Map presentation preferences: marker style + basemap theme (both persisted).
   const [markerStyle, setMarkerStyle] = React.useState<CustomerMapMarkerStyle>(
@@ -289,112 +264,55 @@ export default function CustomerMapPage() {
     disabled: isLoading,
   };
 
+  // Full-bleed map stage: the map fills the view edge-to-edge and every
+  // control floats over it (z-zones: map 0 · legend/offline/empty 10 ·
+  // sidebar+toolbar 20 · detail card 30). The route breadcrumb already labels
+  // this view, so only an sr-only heading remains for assistive tech.
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-3 p-2 sm:p-4 lg:p-5">
-      <div className="flex shrink-0 flex-wrap items-center justify-between gap-x-3 gap-y-2">
-        <div className="flex min-w-0 items-center gap-2.5">
-          <div className="shrink-0 rounded-xl bg-primary/10 p-2">
-            <MapPinned className="size-5 text-primary" />
-          </div>
-          <div className="min-w-0">
-            <h1 className="truncate text-base font-semibold tracking-tight sm:text-lg">
-              Customer Map
-            </h1>
-            <p className="hidden truncate text-xs text-muted-foreground sm:block">
-              Active customer locations across every dealer under HQ, coloured by dealer.
-            </p>
-          </div>
-        </div>
+    <div className="relative min-h-0 flex-1 overflow-hidden">
+      <h1 className="sr-only">Customer Map</h1>
 
-        <div className="flex items-center gap-2">
-          {/* Filter layout switch — a persisted user preference */}
-          <div
-            className="hidden items-center gap-0.5 rounded-lg border border-border p-0.5 lg:flex"
-            role="group"
-            aria-label="Filter layout"
-          >
-            <button
-              type="button"
-              onClick={() => changeLayout("sidebar")}
-              aria-pressed={layout === "sidebar"}
-              title="Filter sidebar"
-              className={cn(
-                "flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium transition-colors",
-                layout === "sidebar"
-                  ? "bg-primary text-primary-foreground"
-                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
-              )}
-            >
-              <PanelLeft className="size-3.5" />
-              <span>Sidebar</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => changeLayout("bar")}
-              aria-pressed={layout === "bar"}
-              title="Filter bar"
-              className={cn(
-                "flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium transition-colors",
-                layout === "bar"
-                  ? "bg-primary text-primary-foreground"
-                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
-              )}
-            >
-              <Rows3 className="size-3.5" />
-              <span>Bar</span>
-            </button>
-          </div>
+      <CustomerMapView
+        customers={filteredCustomers}
+        dealers={dealers}
+        dealerStatuses={data?.dealerStatuses ?? []}
+        perDealerCounts={perDealerCounts}
+        markerStyle={markerStyle}
+        basemap={basemap}
+        boundaryHighlight={boundaryHighlight}
+      />
 
-          <MapStyleSwitch
-            markerStyle={markerStyle}
-            onMarkerStyleChange={changeMarkerStyle}
-            basemap={basemap}
-            onBasemapChange={changeBasemap}
-          />
-
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={refresh}
-            disabled={isLoading}
-            className="h-9 shrink-0 gap-2"
-            title="Refresh data"
-          >
-            <RefreshCw className={cn("size-4", isLoading && "animate-spin")} />
-            <span className="hidden sm:inline">Refresh</span>
-          </Button>
-        </div>
+      {/* Floating top-right toolbar: map style + refresh (all widths). */}
+      <div className="absolute right-3 top-3 z-20 flex max-w-[calc(100%-1.5rem)] items-center gap-2 overflow-x-auto rounded-xl border border-border/60 bg-card/85 px-2 py-1.5 shadow-lg backdrop-blur-md">
+        <MapStyleSwitch
+          markerStyle={markerStyle}
+          onMarkerStyleChange={changeMarkerStyle}
+          basemap={basemap}
+          onBasemapChange={changeBasemap}
+        />
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={refresh}
+          disabled={isLoading}
+          className="h-9 shrink-0 gap-2"
+          title="Refresh data"
+          aria-label="Refresh data"
+        >
+          <RefreshCw className={cn("size-4", isLoading && "animate-spin")} />
+          <span className="hidden sm:inline">Refresh</span>
+        </Button>
       </div>
 
-      {/* Mobile: filter drawer (all layouts) */}
-      <CustomerMapFilters {...filterProps} />
+      {/* Floating filter panel overlaid inside the map (desktop). */}
+      <div className="absolute bottom-3 left-3 top-3 z-20 hidden lg:block">
+        <CustomerMapSidebar {...filterProps} />
+      </div>
 
-      <div className="flex min-h-0 flex-1 gap-3">
-        {layout === "sidebar" && (
-          <div className="hidden shrink-0 lg:flex">
-            <CustomerMapSidebar {...filterProps} />
-          </div>
-        )}
-
-        <div className="flex min-h-0 flex-1 flex-col gap-3">
-          {layout === "bar" && (
-            <div className="hidden lg:block">
-              <CustomerMapToolbar {...filterProps} />
-            </div>
-          )}
-
-          <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-card">
-            <CustomerMapView
-              customers={filteredCustomers}
-              dealers={dealers}
-              dealerStatuses={data?.dealerStatuses ?? []}
-              perDealerCounts={perDealerCounts}
-              markerStyle={markerStyle}
-              basemap={basemap}
-              boundaryHighlight={boundaryHighlight}
-            />
-          </div>
-        </div>
+      {/* Mobile filter drawer trigger as a floating pill beneath the toolbar,
+          so the two never collide even at 375px wide. */}
+      <div className="absolute left-3 top-[4.75rem] z-20 lg:hidden">
+        <CustomerMapFilters {...filterProps} />
       </div>
     </div>
   );
