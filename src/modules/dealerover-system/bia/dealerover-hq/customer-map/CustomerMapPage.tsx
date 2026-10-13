@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { MapPinned, RefreshCw } from "lucide-react";
+import { MapPinned, PanelLeft, RefreshCw, Rows3 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { ErrorPage } from "@/app/(dealerover-system)/dealerover-system/_components/ErrorPage";
@@ -11,9 +11,15 @@ import {
 } from "./types";
 import { useCustomerMap } from "./hooks/useCustomerMap";
 import { CustomerMapFilters } from "./components/CustomerMapFilters";
+import { CustomerMapToolbar } from "./components/CustomerMapToolbar";
+import { CustomerMapSidebar } from "./components/CustomerMapSidebar";
 import { CustomerMapSkeleton } from "./components/CustomerMapSkeleton";
 import { CustomerMapView } from "./components/CustomerMapView";
 import { getDealerColor } from "./utils/dealer-colors";
+
+type DesktopLayout = "bar" | "sidebar";
+
+const LAYOUT_STORAGE_KEY = "hq-customer-map-layout";
 
 function uniqueSorted(values: string[]): string[] {
   const set = new Set<string>();
@@ -29,6 +35,27 @@ export default function CustomerMapPage() {
   const [filters, setFilters] = React.useState<CustomerMapFilterState>({
     ...EMPTY_CUSTOMER_MAP_FILTERS,
   });
+
+  // Filter-layout switch: "bar" (pinned toolbar above the map) or "sidebar"
+  // (vertical split rail). Kept as a first-class feature — the choice is
+  // remembered locally as the user's preference.
+  const [layout, setLayout] = React.useState<DesktopLayout>("bar");
+  React.useEffect(() => {
+    try {
+      const stored = localStorage.getItem(LAYOUT_STORAGE_KEY);
+      if (stored === "bar" || stored === "sidebar") setLayout(stored);
+    } catch {
+      // Ignore storage errors.
+    }
+  }, []);
+  const changeLayout = React.useCallback((next: DesktopLayout) => {
+    setLayout(next);
+    try {
+      localStorage.setItem(LAYOUT_STORAGE_KEY, next);
+    } catch {
+      // Ignore storage errors.
+    }
+  }, []);
 
   // Only active customers (isActive === 1) are ever plotted or counted.
   const activeCustomers = React.useMemo(
@@ -189,6 +216,22 @@ export default function CustomerMapPage() {
     return <ErrorPage message={data.error ?? "Failed to load the customer map"} onRefresh={refresh} />;
   }
 
+  const filterProps = {
+    filters,
+    onChange: handleFilterChange,
+    onReset: handleReset,
+    dealers,
+    provinceOptions,
+    cityOptions,
+    brgyOptions,
+    storeTypeOptions,
+    classificationOptions,
+    priceTypeOptions,
+    paymentTermOptions,
+    resultCount: filteredCustomers.length,
+    disabled: isLoading,
+  };
+
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3 p-2 sm:p-4 lg:p-5">
       <div className="flex shrink-0 items-center justify-between gap-3">
@@ -205,42 +248,86 @@ export default function CustomerMapPage() {
             </p>
           </div>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={refresh}
-          disabled={isLoading}
-          className="h-9 shrink-0 gap-2"
-          title="Refresh data"
-        >
-          <RefreshCw className={cn("size-4", isLoading && "animate-spin")} />
-          <span className="hidden sm:inline">Refresh</span>
-        </Button>
+
+        <div className="flex items-center gap-2">
+          {/* Filter layout switch — a persisted user preference */}
+          <div
+            className="hidden items-center gap-0.5 rounded-lg border border-border p-0.5 lg:flex"
+            role="group"
+            aria-label="Filter layout"
+          >
+            <button
+              type="button"
+              onClick={() => changeLayout("bar")}
+              aria-pressed={layout === "bar"}
+              title="Filter bar"
+              className={cn(
+                "flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium transition-colors",
+                layout === "bar"
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
+              )}
+            >
+              <Rows3 className="size-3.5" />
+              <span>Bar</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => changeLayout("sidebar")}
+              aria-pressed={layout === "sidebar"}
+              title="Filter sidebar"
+              className={cn(
+                "flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium transition-colors",
+                layout === "sidebar"
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
+              )}
+            >
+              <PanelLeft className="size-3.5" />
+              <span>Sidebar</span>
+            </button>
+          </div>
+
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={refresh}
+            disabled={isLoading}
+            className="h-9 shrink-0 gap-2"
+            title="Refresh data"
+          >
+            <RefreshCw className={cn("size-4", isLoading && "animate-spin")} />
+            <span className="hidden sm:inline">Refresh</span>
+          </Button>
+        </div>
       </div>
 
-      <CustomerMapFilters
-        filters={filters}
-        onChange={handleFilterChange}
-        onReset={handleReset}
-        dealers={dealers}
-        provinceOptions={provinceOptions}
-        cityOptions={cityOptions}
-        brgyOptions={brgyOptions}
-        storeTypeOptions={storeTypeOptions}
-        classificationOptions={classificationOptions}
-        priceTypeOptions={priceTypeOptions}
-        paymentTermOptions={paymentTermOptions}
-        resultCount={filteredCustomers.length}
-        disabled={isLoading}
-      />
+      {/* Mobile: filter drawer (all layouts) */}
+      <CustomerMapFilters {...filterProps} />
 
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-card">
-        <CustomerMapView
-          customers={filteredCustomers}
-          dealers={dealers}
-          dealerStatuses={data?.dealerStatuses ?? []}
-          perDealerCounts={perDealerCounts}
-        />
+      <div className="flex min-h-0 flex-1 gap-3">
+        {layout === "sidebar" && (
+          <div className="hidden shrink-0 lg:flex">
+            <CustomerMapSidebar {...filterProps} />
+          </div>
+        )}
+
+        <div className="flex min-h-0 flex-1 flex-col gap-3">
+          {layout === "bar" && (
+            <div className="hidden lg:block">
+              <CustomerMapToolbar {...filterProps} />
+            </div>
+          )}
+
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-card">
+            <CustomerMapView
+              customers={filteredCustomers}
+              dealers={dealers}
+              dealerStatuses={data?.dealerStatuses ?? []}
+              perDealerCounts={perDealerCounts}
+            />
+          </div>
+        </div>
       </div>
     </div>
   );
