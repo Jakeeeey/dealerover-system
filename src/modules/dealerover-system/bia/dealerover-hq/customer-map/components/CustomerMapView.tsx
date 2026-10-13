@@ -48,9 +48,10 @@ const BOUNDARY_LAYER_IDS = [
 ];
 const BOUNDARY_SOURCE_IDS = [BOUNDARY_SOURCE_ID, DIM_SOURCE_ID];
 
-/** Chaikin corner-cutting passes applied to the highlight rings (0 = off; the
- * geoBoundaries shapes are already detailed, so no cosmetic smoothing). */
-const BOUNDARY_SMOOTHING_ITERATIONS = 0;
+/** Chaikin corner-cutting passes applied to the highlight rings (0 = off).
+ * The detailed boundaries carry dense vertices, so a single light pass only
+ * takes the residual angular edge off without visibly pulling the outline in. */
+const BOUNDARY_SMOOTHING_ITERATIONS = 1;
 
 /** Loose GeoJSON boundary payload served by the boundary API route. */
 export interface BoundaryHighlightGeometry {
