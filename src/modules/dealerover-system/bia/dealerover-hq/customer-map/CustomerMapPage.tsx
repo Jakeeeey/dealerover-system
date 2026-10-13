@@ -147,6 +147,17 @@ export default function CustomerMapPage() {
     setFilters({ ...EMPTY_CUSTOMER_MAP_FILTERS });
   }, []);
 
+  // Legend chip toggle: flips one dealer's membership (empty array = all).
+  const handleToggleDealer = React.useCallback(
+    (dealerId: string) => {
+      const next = filters.dealerIds.includes(dealerId)
+        ? filters.dealerIds.filter((id) => id !== dealerId)
+        : [...filters.dealerIds, dealerId];
+      handleFilterChange({ dealerIds: next });
+    },
+    [filters.dealerIds, handleFilterChange],
+  );
+
   const scopedCustomers = React.useMemo(
     () =>
       filters.dealerIds.length
@@ -280,6 +291,8 @@ export default function CustomerMapPage() {
         markerStyle={markerStyle}
         basemap={basemap}
         boundaryHighlight={boundaryHighlight}
+        selectedDealerIds={filters.dealerIds}
+        onToggleDealer={handleToggleDealer}
       />
 
       {/* Floating top-right toolbar: map style + refresh (all widths). */}

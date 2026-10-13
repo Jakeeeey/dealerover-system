@@ -3,13 +3,14 @@
 import "maplibre-gl/dist/maplibre-gl.css";
 
 import * as React from "react";
-import { CircleAlert, MapPin, MapPinOff, X } from "lucide-react";
+import { ChevronDown, ChevronUp, CircleAlert, MapPin, MapPinOff, X } from "lucide-react";
 import type {
   GeoJSONSource,
   Map as MapLibreMap,
   MapMouseEvent,
 } from "maplibre-gl";
-import { formatNumber } from "@/lib/utils";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { cn, formatNumber } from "@/lib/utils";
 import type {
   CustomerMapBasemap,
   CustomerMapMarkerStyle,
@@ -33,16 +34,17 @@ const DIM_SOURCE_ID = "boundary-dim-mask";
 const DIM_ID = "boundary-dim";
 const TINT_ID = "boundary-tint";
 const GLOW_FAR_ID = "boundary-glow-far";
-const GLOW_MID_ID = "boundary-glow-mid";
 const GLOW_NEAR_ID = "boundary-glow-near";
+/** Legacy id from the retired 3-pass halo — removed if still on the map. */
+const GLOW_MID_LEGACY_ID = "boundary-glow-mid";
 const LINE_ID = "boundary-line";
 const CORE_ID = "boundary-core";
 const BOUNDARY_LAYER_IDS = [
   DIM_ID,
   TINT_ID,
   GLOW_FAR_ID,
-  GLOW_MID_ID,
   GLOW_NEAR_ID,
+  GLOW_MID_LEGACY_ID,
   LINE_ID,
   CORE_ID,
 ];
@@ -52,6 +54,10 @@ const BOUNDARY_SOURCE_IDS = [BOUNDARY_SOURCE_ID, DIM_SOURCE_ID];
  * The detailed boundaries carry dense vertices, so a single light pass only
  * takes the residual angular edge off without visibly pulling the outline in. */
 const BOUNDARY_SMOOTHING_ITERATIONS = 1;
+
+/** Rings smaller than this absolute signed area (deg²) are dropped from the
+ * highlight + dim mask, so tiny coastal islets/inlets no longer spray glow. */
+const MIN_HIGHLIGHT_RING_AREA = 2e-6;
 
 /** Loose GeoJSON boundary payload served by the boundary API route. */
 export interface BoundaryHighlightGeometry {
@@ -117,6 +123,10 @@ interface CustomerMapViewProps {
   basemap: CustomerMapBasemap;
   /** Selected boundary highlight (null = none). Drives the dim/tint/glow layers. */
   boundaryHighlight?: BoundaryHighlight | null;
+  /** Dealer ids in the filter (empty = all). Drives legend chip toggle state. */
+  selectedDealerIds: string[];
+  /** Flips one dealer's membership in the filter (empty array = all). */
+  onToggleDealer: (dealerId: string) => void;
 }
 
 function buildMappableData(
@@ -241,13 +251,20 @@ function chaikinClosed(ring: Ring, iterations: number): Ring {
   return pts;
 }
 
-/** Smoothed exterior rings of the selection (Polygon + MultiPolygon). */
+/** Smoothed exterior rings of the selection (Polygon + MultiPolygon).
+ * Negligible rings (tiny islets/inlets) are dropped so they never reach the
+ * tint/glow layers or the dim-mask holes. */
 function smoothedExteriorRings(highlight: BoundaryHighlight): Ring[] {
-  return exteriorRings(highlight).map((ring) =>
-    BOUNDARY_SMOOTHING_ITERATIONS > 0
-      ? chaikinClosed(ring, BOUNDARY_SMOOTHING_ITERATIONS)
-      : ring,
-  );
+  const rings: Ring[] = [];
+  for (const ring of exteriorRings(highlight)) {
+    if (Math.abs(signedRingArea(ring)) < MIN_HIGHLIGHT_RING_AREA) continue;
+    rings.push(
+      BOUNDARY_SMOOTHING_ITERATIONS > 0
+        ? chaikinClosed(ring, BOUNDARY_SMOOTHING_ITERATIONS)
+        : ring,
+    );
+  }
+  return rings;
 }
 
 /** Rebuilds the selection as smoothed polygons for the tint + glow layers. */
@@ -434,10 +451,17 @@ function applyBoundaryLayers(map: MapLibreMap, highlight: BoundaryHighlight | nu
     map.setPaintProperty(id, "line-opacity", opacity);
   };
 
-  // Neon halo: far → near, growing brightness.
-  glow(GLOW_FAR_ID, 34, 20, 0.45);
-  glow(GLOW_MID_ID, 20, 12, 0.65);
-  glow(GLOW_NEAR_ID, 11, 5, 0.9);
+  // Tight two-pass neon halo: small blurs keep coastlines crisp instead of
+  // smearing a fuzzy fringe over every islet and inlet.
+  glow(GLOW_FAR_ID, 18, 6, 0.5);
+  glow(GLOW_NEAR_ID, 9, 2.5, 0.9);
+
+  // Retired middle halo pass — left behind by older sessions/HMR.
+  try {
+    if (map.getLayer(GLOW_MID_LEGACY_ID)) map.removeLayer(GLOW_MID_LEGACY_ID);
+  } catch {
+    // Already gone — nothing to do.
+  }
 
   if (!map.getLayer(LINE_ID)) {
     map.addLayer({
@@ -474,7 +498,6 @@ function applyBoundaryLayers(map: MapLibreMap, highlight: BoundaryHighlight | nu
     HEAT_ID,
     CIRCLE_ID,
     GLOW_FAR_ID,
-    GLOW_MID_ID,
     GLOW_NEAR_ID,
     LINE_ID,
     CORE_ID,
@@ -487,6 +510,80 @@ function applyBoundaryLayers(map: MapLibreMap, highlight: BoundaryHighlight | nu
   }
 }
 
+/** Max dealer chips rendered inline in the legend pill — anything beyond
+ * this lives in the "+N" popover, so the pill stays contained at 375px. */
+const MAX_INLINE_DEALER_CHIPS = 4;
+
+interface DealerToggleProps {
+  dealer: DealerLegendItem;
+  count: number;
+  offline: boolean;
+  active: boolean;
+  onToggle: () => void;
+}
+
+function DealerDot({ color }: { color: string }) {
+  return (
+    <span
+      className="size-2.5 shrink-0 rounded-full ring-1 ring-border"
+      style={{ backgroundColor: color }}
+      aria-hidden
+    />
+  );
+}
+
+/** Inline pill chip — a filter toggle (colour dot + name + count). */
+function DealerLegendChip({ dealer, count, offline, active, onToggle }: DealerToggleProps) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-pressed={active}
+      title={`${dealer.name} — ${active ? "click to hide" : "click to show"}`}
+      className={cn(
+        "flex shrink-0 items-center gap-2 rounded-full border border-border px-2.5 py-1 text-xs transition-colors hover:bg-accent",
+        !active && "opacity-50",
+      )}
+    >
+      <DealerDot color={dealer.color} />
+      <span className="max-w-[110px] truncate" title={dealer.name}>
+        {dealer.name}
+      </span>
+      {offline ? (
+        <span className="font-medium text-destructive">offline</span>
+      ) : (
+        <span className="tabular-nums text-muted-foreground">{formatNumber(count)}</span>
+      )}
+    </button>
+  );
+}
+
+/** Full-width row inside the "+N" popover — same toggle, room for long names. */
+function DealerLegendRow({ dealer, count, offline, active, onToggle }: DealerToggleProps) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-pressed={active}
+      title={`${dealer.name} — ${active ? "click to hide" : "click to show"}`}
+      className={cn(
+        "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-xs transition-colors hover:bg-accent",
+        !active && "opacity-50",
+      )}
+    >
+      <DealerDot color={dealer.color} />
+      <span className="min-w-0 flex-1 truncate text-left" title={dealer.name}>
+        {dealer.name}
+      </span>
+      {offline ? (
+        <span className="shrink-0 font-medium text-destructive">offline</span>
+      ) : (
+        <span className="shrink-0 tabular-nums text-muted-foreground">{formatNumber(count)}</span>
+      )}
+    </button>
+  );
+}
+
 export function CustomerMapView({
   customers,
   dealers,
@@ -495,6 +592,8 @@ export function CustomerMapView({
   markerStyle,
   basemap,
   boundaryHighlight = null,
+  selectedDealerIds,
+  onToggleDealer,
 }: CustomerMapViewProps) {
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const mapRef = React.useRef<MapLibreMap | null>(null);
@@ -516,6 +615,16 @@ export function CustomerMapView({
     () => dealerStatuses.filter((status) => !status.online),
     [dealerStatuses],
   );
+
+  const offlineDealerIds = React.useMemo(
+    () => new Set(offlineDealers.map((status) => status.dealerId)),
+    [offlineDealers],
+  );
+  // Empty selection = all dealers shown, so every chip reads active.
+  const isDealerActive = (dealerId: string) =>
+    selectedDealerIds.length === 0 || selectedDealerIds.includes(dealerId);
+  const inlineDealers = dealers.slice(0, MAX_INLINE_DEALER_CHIPS);
+  const overflowCount = dealers.length - inlineDealers.length;
 
   // Latest render values for the map's style/event callbacks (which outlive renders).
   const latest = React.useRef({
@@ -796,52 +905,78 @@ export function CustomerMapView({
           </div>
         )}
 
-      {/* Dealer legend pill — floats bottom-center, scrolls horizontally so
-          many dealers never wrap or cover the map. */}
-      <div className="absolute bottom-3 left-1/2 z-10 flex max-w-[calc(100%-1.5rem)] -translate-x-1/2 items-center gap-3 overflow-x-auto rounded-xl border border-border/60 bg-card/85 px-3 py-2 shadow-lg backdrop-blur-md">
-        <button
-          type="button"
-          onClick={() => setLegendOpen((open) => !open)}
-          className="flex min-h-9 shrink-0 items-center whitespace-nowrap text-xs text-muted-foreground transition-colors hover:text-foreground"
-          title={legendOpen ? "Hide legend" : "Show legend"}
-        >
+      {/* Dealer legend pill — floats bottom-center. The total is plain text;
+          each chip is a filter toggle (colour dot + name + count). At most 4
+          chips render inline; the rest live in a "+N" popover, so the pill
+          stays contained instead of scrolling endlessly. */}
+      <div className="absolute bottom-3 left-1/2 z-10 flex max-w-[calc(100%-1.5rem)] -translate-x-1/2 items-center gap-2 overflow-hidden rounded-xl border border-border/60 bg-card/85 px-3 py-2 shadow-lg backdrop-blur-md">
+        <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground">
           <span className="font-semibold tabular-nums text-foreground">
             {formatNumber(customers.length)}
           </span>{" "}
           plotted
-        </button>
+        </span>
 
-        {legendOpen && (
+        {dealers.length > 0 && (
           <>
-            <span className="h-4 w-px shrink-0 bg-border" aria-hidden />
-            <ul className="flex items-center gap-2">
-              {dealers.map((dealer) => {
-                const status = dealerStatuses.find((entry) => entry.dealerId === dealer.id);
-                const offline = status ? !status.online : false;
-                return (
-                  <li
-                    key={dealer.id}
-                    className="flex shrink-0 items-center gap-2 rounded-full border border-border px-2.5 py-1 text-xs"
-                  >
-                    <span
-                      className="size-2.5 shrink-0 rounded-full ring-1 ring-border"
-                      style={{ backgroundColor: dealer.color }}
-                      aria-hidden
-                    />
-                    <span className="max-w-[160px] truncate" title={dealer.name}>
-                      {dealer.name}
-                    </span>
-                    {offline ? (
-                      <span className="font-medium text-destructive">offline</span>
-                    ) : (
-                      <span className="tabular-nums text-muted-foreground">
-                        {formatNumber(perDealerCounts[dealer.id] ?? 0)}
-                      </span>
-                    )}
-                  </li>
-                );
-              })}
-            </ul>
+            <button
+              type="button"
+              onClick={() => setLegendOpen((open) => !open)}
+              className="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              aria-label={legendOpen ? "Hide dealer legend" : "Show dealer legend"}
+              title={legendOpen ? "Hide dealer legend" : "Show dealer legend"}
+              aria-expanded={legendOpen}
+            >
+              {legendOpen ? <ChevronUp className="size-4" /> : <ChevronDown className="size-4" />}
+            </button>
+
+            {legendOpen && (
+              <>
+                <span className="h-4 w-px shrink-0 bg-border" aria-hidden />
+                <ul className="flex min-w-0 items-center gap-1.5 overflow-x-auto">
+                  {inlineDealers.map((dealer) => (
+                    <li key={dealer.id} className="shrink-0">
+                      <DealerLegendChip
+                        dealer={dealer}
+                        count={perDealerCounts[dealer.id] ?? 0}
+                        offline={offlineDealerIds.has(dealer.id)}
+                        active={isDealerActive(dealer.id)}
+                        onToggle={() => onToggleDealer(dealer.id)}
+                      />
+                    </li>
+                  ))}
+                </ul>
+                {overflowCount > 0 && (
+                  <Popover>
+                    <PopoverTrigger asChild>
+                      <button
+                        type="button"
+                        className="shrink-0 rounded-full border border-border px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                        aria-label={`Show ${overflowCount} more dealers`}
+                        title={`Show ${overflowCount} more dealers`}
+                      >
+                        +{overflowCount}
+                      </button>
+                    </PopoverTrigger>
+                    <PopoverContent side="top" align="center" className="w-[260px] p-1">
+                      <ul className="max-h-64 overflow-y-auto overscroll-contain">
+                        {dealers.map((dealer) => (
+                          <li key={dealer.id}>
+                            <DealerLegendRow
+                              dealer={dealer}
+                              count={perDealerCounts[dealer.id] ?? 0}
+                              offline={offlineDealerIds.has(dealer.id)}
+                              active={isDealerActive(dealer.id)}
+                              onToggle={() => onToggleDealer(dealer.id)}
+                            />
+                          </li>
+                        ))}
+                      </ul>
+                    </PopoverContent>
+                  </Popover>
+                )}
+              </>
+            )}
           </>
         )}
       </div>
