@@ -7,17 +7,57 @@ import { CircleAlert, MapPin, MapPinOff, X } from "lucide-react";
 import type {
   GeoJSONSource,
   Map as MapLibreMap,
-  MapLayerMouseEvent,
   MapMouseEvent,
 } from "maplibre-gl";
 import { formatNumber } from "@/lib/utils";
-import type { CustomerMapRow, DealerStatus } from "../types";
+import type {
+  CustomerMapBasemap,
+  CustomerMapMarkerStyle,
+  CustomerMapRow,
+  DealerStatus,
+} from "../types";
 import { MARKER_STROKE_COLOR } from "../utils/dealer-colors";
 
-// Keyless raster basemap (Carto Positron) — no API token required.
-const MAP_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json";
 const SOURCE_ID = "customer-points";
-const LAYER_ID = "customer-points-circle";
+const HEAT_ID = "customer-heat";
+const CIRCLE_ID = "customer-points-circle";
+
+// Boundary highlight (selected province/city/barangay): a dim mask with the
+// selection cut out as holes, a subtle tint over the selection, and a
+// two-pass glow border. Rebuilt in `applyLayers` so basemap swaps keep them.
+const BOUNDARY_SOURCE_ID = "boundary-highlight";
+const DIM_SOURCE_ID = "boundary-dim-mask";
+const DIM_ID = "boundary-dim";
+const TINT_ID = "boundary-tint";
+const HALO_ID = "boundary-halo";
+const LINE_ID = "boundary-line";
+
+/** Loose GeoJSON boundary payload served by the boundary API route. */
+export interface BoundaryHighlightGeometry {
+  type: string;
+  coordinates: unknown;
+}
+
+export interface BoundaryHighlightFeature {
+  type: "Feature";
+  properties: Record<string, unknown>;
+  geometry: BoundaryHighlightGeometry | null;
+}
+
+export interface BoundaryHighlight {
+  type: "FeatureCollection";
+  features: BoundaryHighlightFeature[];
+}
+
+// Basemaps from OpenFreeMap: keyless, no request caps, commercial use allowed,
+// OpenMapTiles schema (a drop-in for MapLibre). Attribution is auto-added.
+const BASEMAP_STYLES: Record<CustomerMapBasemap, string> = {
+  liberty: "https://tiles.openfreemap.org/styles/liberty",
+  positron: "https://tiles.openfreemap.org/styles/positron",
+  dark: "https://tiles.openfreemap.org/styles/dark",
+  bright: "https://tiles.openfreemap.org/styles/bright",
+  fiord: "https://tiles.openfreemap.org/styles/fiord",
+};
 
 type MappableData = Parameters<GeoJSONSource["setData"]>[0];
 
@@ -52,9 +92,11 @@ interface CustomerMapViewProps {
   dealers: DealerLegendItem[];
   dealerStatuses: DealerStatus[];
   perDealerCounts: Record<string, number>;
+  markerStyle: CustomerMapMarkerStyle;
+  basemap: CustomerMapBasemap;
+  /** Selected boundary highlight (null = none). Drives the dim/tint/glow layers. */
+  boundaryHighlight?: BoundaryHighlight | null;
 }
-
-const EMPTY_DATA: MappableData = { type: "FeatureCollection", features: [] };
 
 function buildMappableData(
   customers: CustomerMapRow[],
@@ -97,14 +139,256 @@ function DetailRow({ label, value }: { label: string; value: string }) {
   );
 }
 
+type Ring = Array<[number, number]>;
+
+function isRing(value: unknown): value is Ring {
+  return (
+    Array.isArray(value) &&
+    value.length >= 4 &&
+    value.every(
+      (point) =>
+        Array.isArray(point) &&
+        point.length >= 2 &&
+        typeof point[0] === "number" &&
+        typeof point[1] === "number" &&
+        Number.isFinite(point[0]) &&
+        Number.isFinite(point[1]),
+    )
+  );
+}
+
+/** Signed ring area: positive = counter-clockwise, negative = clockwise. */
+function signedRingArea(ring: Ring): number {
+  let sum = 0;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i, i += 1) {
+    sum += ring[j][0] * ring[i][1] - ring[i][0] * ring[j][1];
+  }
+  return sum / 2;
+}
+
+function forceWinding(ring: Ring, clockwise: boolean): Ring {
+  const isClockwise = signedRingArea(ring) < 0;
+  if (isClockwise === clockwise) return ring;
+  return [...ring].reverse() as Ring;
+}
+
+/**
+ * Collects every exterior ring of the highlight (Polygon + MultiPolygon).
+ * Interior holes of the selection itself are ignored — the mask only cuts
+ * the selection's outer shape out of the world wash.
+ */
+function exteriorRings(highlight: BoundaryHighlight): Ring[] {
+  const rings: Ring[] = [];
+  for (const feature of highlight.features ?? []) {
+    const geometry = feature.geometry;
+    if (!geometry) continue;
+    if (geometry.type === "Polygon" && Array.isArray(geometry.coordinates)) {
+      const exterior: unknown = (geometry.coordinates as unknown[])[0];
+      if (isRing(exterior)) rings.push(exterior);
+    } else if (geometry.type === "MultiPolygon" && Array.isArray(geometry.coordinates)) {
+      for (const polygon of geometry.coordinates as unknown[]) {
+        const exterior: unknown = Array.isArray(polygon) ? polygon[0] : null;
+        if (isRing(exterior)) rings.push(exterior);
+      }
+    }
+  }
+  return rings;
+}
+
+/**
+ * Builds the dim mask: a world-sized exterior with the selection's exterior
+ * rings cut out as (clockwise) holes, so everything OUTSIDE the selection is
+ * washed while the selection itself stays bright.
+ */
+function buildDimMask(highlight: BoundaryHighlight): MappableData | null {
+  const holes = exteriorRings(highlight);
+  if (holes.length === 0) return null;
+  const world: Ring = [
+    [-180, -90],
+    [180, -90],
+    [180, 90],
+    [-180, 90],
+    [-180, -90],
+  ];
+  return {
+    type: "Feature",
+    geometry: {
+      type: "Polygon",
+      coordinates: [forceWinding(world, false), ...holes.map((ring) => forceWinding(ring, true))],
+    },
+    properties: {},
+  } as unknown as MappableData;
+}
+
+function hslToHex(h: number, s: number, l: number): string {
+  const sat = Math.min(1, Math.max(0, s / 100));
+  const light = Math.min(1, Math.max(0, l / 100));
+  const c = (1 - Math.abs(2 * light - 1)) * sat;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = light - c / 2;
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  const sector = ((Math.round(h) % 360) + 360) % 360;
+  if (sector < 60) {
+    r = c;
+    g = x;
+  } else if (sector < 120) {
+    r = x;
+    g = c;
+  } else if (sector < 180) {
+    g = c;
+    b = x;
+  } else if (sector < 240) {
+    g = x;
+    b = c;
+  } else if (sector < 300) {
+    r = x;
+    b = c;
+  } else {
+    r = c;
+    b = x;
+  }
+  const toHex = (v: number) =>
+    Math.round((v + m) * 255)
+      .toString(16)
+      .padStart(2, "0");
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+/**
+ * Reads the theme accent at runtime so the glow border matches light/dark.
+ * NOTE: MapLibre paints live on a WebGL canvas, which cannot consume CSS
+ * theme tokens (same reason the dealer palette uses explicit values) — the
+ * theme value is resolved to a concrete colour here, with a hex fallback.
+ * @returns {string} A MapLibre-compatible colour string.
+ */
+function resolveAccentColor(): string {
+  const FALLBACK = "#1D4ED8";
+  try {
+    const raw = getComputedStyle(document.documentElement).getPropertyValue("--primary").trim();
+    if (!raw) return FALLBACK;
+    if (/^#[0-9a-fA-F]{6}$/.test(raw)) return raw;
+    if (/^rgba?\(/.test(raw) || /^hsla?\(/.test(raw)) return raw;
+    const triplet = raw.match(/^([\d.]+)\s+([\d.]+)%\s+([\d.]+)%$/);
+    if (triplet) {
+      return hslToHex(Number(triplet[1]), Number(triplet[2]), Number(triplet[3]));
+    }
+    return FALLBACK;
+  } catch {
+    return FALLBACK;
+  }
+}
+
+/**
+ * (Re)builds the boundary highlight layers: dim mask (world wash with the
+ * selection cut out), subtle tint over the selection, and a two-pass glow
+ * border (wide blurred halo + crisp inner line). Removes everything when the
+ * highlight is null/empty. Layer order is enforced bottom-to-top so the dim
+ * wash never covers the customer points.
+ * @param {MapLibreMap} map - Live MapLibre instance.
+ * @param {BoundaryHighlight | null} highlight - Selected boundary, if any.
+ */
+function applyBoundaryLayers(map: MapLibreMap, highlight: BoundaryHighlight | null): void {
+  const mask = highlight && highlight.features.length > 0 ? buildDimMask(highlight) : null;
+  if (!mask || !highlight) {
+    for (const id of [LINE_ID, HALO_ID, TINT_ID, DIM_ID]) {
+      try {
+        if (map.getLayer(id)) map.removeLayer(id);
+      } catch {
+        // Layer already gone with a style swap — nothing to do.
+      }
+    }
+    for (const source of [BOUNDARY_SOURCE_ID, DIM_SOURCE_ID]) {
+      try {
+        if (map.getSource(source)) map.removeSource(source);
+      } catch {
+        // Source already gone with a style swap — nothing to do.
+      }
+    }
+    return;
+  }
+
+  const boundaryData = highlight as unknown as MappableData;
+  const existingBoundary = map.getSource(BOUNDARY_SOURCE_ID) as GeoJSONSource | undefined;
+  if (!existingBoundary) map.addSource(BOUNDARY_SOURCE_ID, { type: "geojson", data: boundaryData });
+  else existingBoundary.setData(boundaryData);
+
+  const existingDim = map.getSource(DIM_SOURCE_ID) as GeoJSONSource | undefined;
+  if (!existingDim) map.addSource(DIM_SOURCE_ID, { type: "geojson", data: mask });
+  else existingDim.setData(mask);
+
+  if (!map.getLayer(DIM_ID)) {
+    map.addLayer({
+      id: DIM_ID,
+      type: "fill",
+      source: DIM_SOURCE_ID,
+      paint: { "fill-color": "#000000", "fill-opacity": 0.45 },
+    });
+  }
+  if (!map.getLayer(TINT_ID)) {
+    map.addLayer({
+      id: TINT_ID,
+      type: "fill",
+      source: BOUNDARY_SOURCE_ID,
+      paint: { "fill-color": "#ffffff", "fill-opacity": 0.12 },
+    });
+  }
+
+  // Canvas paints (see resolveAccentColor) — re-read every apply so a
+  // light/dark flip re-tones the glow without a basemap swap.
+  const accent = resolveAccentColor();
+  if (!map.getLayer(HALO_ID)) {
+    map.addLayer({
+      id: HALO_ID,
+      type: "line",
+      source: BOUNDARY_SOURCE_ID,
+      paint: {
+        "line-color": accent,
+        "line-width": 10,
+        "line-blur": 8,
+        "line-opacity": 0.5,
+      },
+    });
+  }
+  if (!map.getLayer(LINE_ID)) {
+    map.addLayer({
+      id: LINE_ID,
+      type: "line",
+      source: BOUNDARY_SOURCE_ID,
+      paint: {
+        "line-color": accent,
+        "line-width": 2.5,
+        "line-opacity": 1,
+      },
+    });
+  }
+  if (map.getLayer(HALO_ID)) map.setPaintProperty(HALO_ID, "line-color", accent);
+  if (map.getLayer(LINE_ID)) map.setPaintProperty(LINE_ID, "line-color", accent);
+
+  // Enforce bottom-to-top stacking: dim + tint under the points, glow above.
+  for (const id of [DIM_ID, TINT_ID, HEAT_ID, CIRCLE_ID, HALO_ID, LINE_ID]) {
+    try {
+      if (map.getLayer(id)) map.moveLayer(id);
+    } catch {
+      // Transient style race — recovered on the next apply.
+    }
+  }
+}
+
 export function CustomerMapView({
   customers,
   dealers,
   dealerStatuses,
   perDealerCounts,
+  markerStyle,
+  basemap,
+  boundaryHighlight = null,
 }: CustomerMapViewProps) {
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const mapRef = React.useRef<MapLibreMap | null>(null);
+  const appliedBasemapRef = React.useRef<CustomerMapBasemap | null>(null);
+  const initialBasemapRef = React.useRef(basemap);
   const [mapReady, setMapReady] = React.useState(false);
   const [selected, setSelected] = React.useState<CustomerFeatureProps | null>(null);
   const [legendOpen, setLegendOpen] = React.useState(true);
@@ -122,6 +406,80 @@ export function CustomerMapView({
     [dealerStatuses],
   );
 
+  // Latest render values for the map's style/event callbacks (which outlive renders).
+  const latest = React.useRef({
+    customers,
+    colors,
+    markerStyle,
+    boundaryHighlight,
+  });
+  latest.current = { customers, colors, markerStyle, boundaryHighlight };
+
+  // (Re)builds the source + layers and applies visibility. Called on the initial
+  // style load, after every basemap style swap, and on data/style changes. No
+  // `isStyleLoaded` gate: during `style.load` that can read false and would skip
+  // the re-add (leaving the map blank until the next render) — try/catch instead.
+  const applyLayers = React.useCallback((map: MapLibreMap) => {
+    const state = latest.current;
+    try {
+      const data = buildMappableData(state.customers, state.colors);
+      const existing = map.getSource(SOURCE_ID) as GeoJSONSource | undefined;
+      if (!existing) map.addSource(SOURCE_ID, { type: "geojson", data });
+      else existing.setData(data);
+
+      if (!map.getLayer(HEAT_ID)) {
+        map.addLayer({
+          id: HEAT_ID,
+          type: "heatmap",
+          source: SOURCE_ID,
+          paint: {
+            "heatmap-weight": 1,
+            "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 5, 0.8, 12, 2.5],
+            "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 5, 14, 12, 30],
+            "heatmap-opacity": 0.85,
+            "heatmap-color": [
+              "interpolate",
+              ["linear"],
+              ["heatmap-density"],
+              0, "rgba(37,99,235,0)",
+              0.2, "rgba(37,99,235,0.55)",
+              0.4, "#22c55e",
+              0.6, "#eab308",
+              0.8, "#f97316",
+              1, "#ef4444",
+            ],
+          },
+        });
+      }
+
+      if (!map.getLayer(CIRCLE_ID)) {
+        map.addLayer({
+          id: CIRCLE_ID,
+          type: "circle",
+          source: SOURCE_ID,
+          paint: {
+            "circle-color": ["get", "color"],
+            "circle-radius": ["interpolate", ["linear"], ["zoom"], 4, 3, 8, 5, 12, 7, 16, 10],
+            "circle-stroke-color": MARKER_STROKE_COLOR,
+            "circle-stroke-width": 1,
+            "circle-opacity": 0.9,
+          },
+        });
+      }
+
+      const show = (id: string, visible: boolean) => {
+        if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visible ? "visible" : "none");
+      };
+      const isHeat = state.markerStyle === "heatmap";
+      show(HEAT_ID, isHeat);
+      show(CIRCLE_ID, !isHeat);
+
+      applyBoundaryLayers(map, state.boundaryHighlight);
+    } catch {
+      // Transient style races are recovered on the next style.load / idle / render.
+    }
+  }, []);
+
   // MapLibre touches the DOM/WebGL, so it is imported only in the browser and
   // the map instance is created once for the component's lifetime.
   React.useEffect(() => {
@@ -133,53 +491,39 @@ export function CustomerMapView({
       if (cancelled || !containerRef.current) return;
       const maplibregl = mod.default;
 
-      map = new maplibregl.Map({
+      const instance = new maplibregl.Map({
         container: containerRef.current,
-        style: MAP_STYLE,
+        style: BASEMAP_STYLES[initialBasemapRef.current],
         center: [121.1, 15.9],
         zoom: 7,
         attributionControl: { compact: true },
       });
-      mapRef.current = map;
+      map = instance;
+      mapRef.current = instance;
+      appliedBasemapRef.current = initialBasemapRef.current;
 
-      map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
-      map.addControl(new maplibregl.ScaleControl({ maxWidth: 100 }), "bottom-left");
+      instance.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+      instance.addControl(new maplibregl.ScaleControl({ maxWidth: 100 }), "bottom-left");
 
-      map.on("load", () => {
-        const instance = mapRef.current;
-        if (!instance) return;
+      // Generic handlers survive style swaps (layer-bound handlers do not).
+      const hitLayers = (): string[] => [CIRCLE_ID].filter((id) => instance.getLayer(id));
+      instance.on("click", (event: MapMouseEvent) => {
+        const layers = hitLayers();
+        const hits = layers.length ? instance.queryRenderedFeatures(event.point, { layers }) : [];
+        setSelected(hits.length ? (hits[0].properties as unknown as CustomerFeatureProps) : null);
+      });
+      instance.on("mousemove", (event: MapMouseEvent) => {
+        const layers = hitLayers();
+        const hits = layers.length ? instance.queryRenderedFeatures(event.point, { layers }) : [];
+        instance.getCanvas().style.cursor = hits.length ? "pointer" : "";
+      });
 
-        instance.addSource(SOURCE_ID, { type: "geojson", data: EMPTY_DATA });
-        instance.addLayer({
-          id: LAYER_ID,
-          type: "circle",
-          source: SOURCE_ID,
-          paint: {
-            "circle-color": ["get", "color"],
-            "circle-radius": ["interpolate", ["linear"], ["zoom"], 4, 3, 8, 5, 12, 7, 16, 10],
-            "circle-stroke-color": MARKER_STROKE_COLOR,
-            "circle-stroke-width": 1,
-            "circle-opacity": 0.9,
-          },
-        });
+      // Fires on the initial load and after every setStyle — re-adds the layers.
+      instance.on("style.load", () => {
+        applyLayers(instance);
+      });
 
-        instance.on("click", LAYER_ID, (event: MapLayerMouseEvent) => {
-          const feature = event.features?.[0];
-          if (feature?.properties) {
-            setSelected(feature.properties as unknown as CustomerFeatureProps);
-          }
-        });
-        instance.on("click", (event: MapMouseEvent) => {
-          const hits = instance.queryRenderedFeatures(event.point, { layers: [LAYER_ID] });
-          if (hits.length === 0) setSelected(null);
-        });
-        instance.on("mouseenter", LAYER_ID, () => {
-          instance.getCanvas().style.cursor = "pointer";
-        });
-        instance.on("mouseleave", LAYER_ID, () => {
-          instance.getCanvas().style.cursor = "";
-        });
-
+      instance.on("load", () => {
         setMapReady(true);
       });
     };
@@ -191,20 +535,47 @@ export function CustomerMapView({
       mapRef.current = null;
       map?.remove();
     };
-  }, []);
+  }, [applyLayers]);
 
-  // Push the current (already filtered) point set into the map and refit bounds.
+  // Swap the basemap when the user changes it. Re-adds layers on style.load, with
+  // an `idle` fallback so the data layers never stay blank after a theme switch.
   React.useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
-    const source = map.getSource(SOURCE_ID) as GeoJSONSource | undefined;
-    if (!source) return;
+    if (appliedBasemapRef.current === basemap) return;
+    appliedBasemapRef.current = basemap;
+    map.setStyle(BASEMAP_STYLES[basemap]);
+    const onIdle = () => applyLayers(map);
+    map.once("idle", onIdle);
+  }, [basemap, mapReady, applyLayers]);
 
-    source.setData(buildMappableData(customers, colors));
+  // Refresh the data + layer visibility when the filtered set or style changes.
+  React.useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    applyLayers(map);
+  }, [customers, colors, markerStyle, boundaryHighlight, mapReady, applyLayers]);
+
+  // Re-tone the glow when light/dark flips (next-themes toggles the class on
+  // <html> without reloading the map style, so applyLayers would not re-run).
+  React.useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const observer = new MutationObserver(() => {
+      const live = mapRef.current;
+      if (live) applyLayers(live);
+    });
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+    return () => observer.disconnect();
+  }, [mapReady, applyLayers]);
+
+  // Refit bounds and drop a now-hidden selection when the filtered set changes.
+  React.useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
     setSelected((previous) =>
       previous && customers.some((customer) => customer.key === previous.key) ? previous : null,
     );
-
     if (customers.length > 0) {
       let minLng = Infinity;
       let minLat = Infinity;
@@ -224,7 +595,7 @@ export function CustomerMapView({
         { padding: 56, maxZoom: 12, duration: 500 },
       );
     }
-  }, [customers, colors, mapReady]);
+  }, [customers, mapReady]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">

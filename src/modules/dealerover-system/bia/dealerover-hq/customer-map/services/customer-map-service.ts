@@ -4,6 +4,7 @@ import {
   type DealerStatus,
   type LookupItem,
 } from "../types";
+import { resolveAdmin } from "./boundaries-service";
 
 /**
  * Server-only aggregation for the HQ customer map.
@@ -343,6 +344,11 @@ export async function fetchCustomerMap(dealerId?: string): Promise<CustomerMapRe
       const id = toInt(raw.id);
       if (id <= 0) continue;
 
+      // Raw PSGC text columns are unreliable (often empty), so geo labels are
+      // derived server-side from the coordinates via the PSGC boundary index.
+      // Rows with no coordinates are dropped above; resolved misses keep "".
+      const admin = resolveAdmin(coords.lng, coords.lat);
+
       const storeTypeId = raw.store_type === null || raw.store_type === undefined
         ? null
         : toInt(raw.store_type);
@@ -360,9 +366,9 @@ export async function fetchCustomerMap(dealerId?: string): Promise<CustomerMapRe
         customer_code: str(raw.customer_code),
         customer_name: str(raw.customer_name),
         store_name: str(raw.store_name),
-        brgy: str(raw.brgy),
-        city: str(raw.city),
-        province: str(raw.province),
+        brgy: admin.brgy ?? "",
+        city: admin.city ?? "",
+        province: admin.province ?? "",
         store_type: storeTypeId,
         store_type_name: storeTypeId !== null ? localStoreTypes.get(storeTypeId) ?? "" : "",
         classification: classificationId,

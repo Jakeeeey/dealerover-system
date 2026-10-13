@@ -90,3 +90,20 @@ export const EMPTY_CUSTOMER_MAP_FILTERS: CustomerMapFilterState = {
   paymentTerm: "",
   search: "",
 };
+
+/** How customer points are drawn on the map. */
+export type CustomerMapMarkerStyle = "dots" | "heatmap";
+
+/** Basemap style (OpenFreeMap — keyless, no caps, commercial use allowed). */
+export type CustomerMapBasemap = "liberty" | "positron" | "dark" | "bright" | "fiord";
+
+export const CUSTOMER_MAP_BASEMAPS: CustomerMapBasemap[] = [
+  "liberty",
+  "positron",
+  "dark",
+  "bright",
+  "fiord",
+];
+
+export const DEFAULT_CUSTOMER_MAP_BASEMAP: CustomerMapBasemap = "liberty";
+export const DEFAULT_CUSTOMER_MAP_MARKER_STYLE: CustomerMapMarkerStyle = "dots";

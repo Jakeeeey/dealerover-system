@@ -123,6 +123,9 @@ export function FilterFields({
           onChange={(value) => onChange({ brgy: value })}
           disabled={disabled || !filters.city}
         />
+        <p className="mt-1 text-[11px] leading-tight text-muted-foreground">
+          Province, city &amp; barangay are derived from the map location.
+        </p>
       </div>
 
       <div className={stacked ? "w-full" : undefined}>

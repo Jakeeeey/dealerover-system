@@ -6,13 +6,20 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { ErrorPage } from "@/app/(dealerover-system)/dealerover-system/_components/ErrorPage";
 import {
+  CUSTOMER_MAP_BASEMAPS,
+  DEFAULT_CUSTOMER_MAP_BASEMAP,
+  DEFAULT_CUSTOMER_MAP_MARKER_STYLE,
   EMPTY_CUSTOMER_MAP_FILTERS,
+  type CustomerMapBasemap,
   type CustomerMapFilterState,
+  type CustomerMapMarkerStyle,
 } from "./types";
 import { useCustomerMap } from "./hooks/useCustomerMap";
+import { useBoundaryFeature, type BoundarySelection } from "./hooks/useBoundaryFeature";
 import { CustomerMapFilters } from "./components/CustomerMapFilters";
 import { CustomerMapToolbar } from "./components/CustomerMapToolbar";
 import { CustomerMapSidebar } from "./components/CustomerMapSidebar";
+import { MapStyleSwitch } from "./components/MapStyleSwitch";
 import { CustomerMapSkeleton } from "./components/CustomerMapSkeleton";
 import { CustomerMapView } from "./components/CustomerMapView";
 import { getDealerColor } from "./utils/dealer-colors";
@@ -20,6 +27,8 @@ import { getDealerColor } from "./utils/dealer-colors";
 type DesktopLayout = "bar" | "sidebar";
 
 const LAYOUT_STORAGE_KEY = "hq-customer-map-layout";
+const MARKER_STORAGE_KEY = "hq-customer-map-marker";
+const BASEMAP_STORAGE_KEY = "hq-customer-map-basemap";
 
 function uniqueSorted(values: string[]): string[] {
   const set = new Set<string>();
@@ -39,7 +48,7 @@ export default function CustomerMapPage() {
   // Filter-layout switch: "bar" (pinned toolbar above the map) or "sidebar"
   // (vertical split rail). Kept as a first-class feature — the choice is
   // remembered locally as the user's preference.
-  const [layout, setLayout] = React.useState<DesktopLayout>("bar");
+  const [layout, setLayout] = React.useState<DesktopLayout>("sidebar");
   React.useEffect(() => {
     try {
       const stored = localStorage.getItem(LAYOUT_STORAGE_KEY);
@@ -52,6 +61,42 @@ export default function CustomerMapPage() {
     setLayout(next);
     try {
       localStorage.setItem(LAYOUT_STORAGE_KEY, next);
+    } catch {
+      // Ignore storage errors.
+    }
+  }, []);
+
+  // Map presentation preferences: marker style + basemap theme (both persisted).
+  const [markerStyle, setMarkerStyle] = React.useState<CustomerMapMarkerStyle>(
+    DEFAULT_CUSTOMER_MAP_MARKER_STYLE,
+  );
+  const [basemap, setBasemap] = React.useState<CustomerMapBasemap>(DEFAULT_CUSTOMER_MAP_BASEMAP);
+  React.useEffect(() => {
+    try {
+      const storedMarker = localStorage.getItem(MARKER_STORAGE_KEY);
+      if (storedMarker === "dots" || storedMarker === "heatmap") {
+        setMarkerStyle(storedMarker);
+      }
+      const storedBasemap = localStorage.getItem(BASEMAP_STORAGE_KEY);
+      if (storedBasemap && (CUSTOMER_MAP_BASEMAPS as string[]).includes(storedBasemap)) {
+        setBasemap(storedBasemap as CustomerMapBasemap);
+      }
+    } catch {
+      // Ignore storage errors.
+    }
+  }, []);
+  const changeMarkerStyle = React.useCallback((next: CustomerMapMarkerStyle) => {
+    setMarkerStyle(next);
+    try {
+      localStorage.setItem(MARKER_STORAGE_KEY, next);
+    } catch {
+      // Ignore storage errors.
+    }
+  }, []);
+  const changeBasemap = React.useCallback((next: CustomerMapBasemap) => {
+    setBasemap(next);
+    try {
+      localStorage.setItem(BASEMAP_STORAGE_KEY, next);
     } catch {
       // Ignore storage errors.
     }
@@ -210,6 +255,18 @@ export default function CustomerMapPage() {
     return counts;
   }, [dealers, filteredCustomers]);
 
+  // Deepest geo filter wins the highlight; the barangay name travels with its
+  // parent city so duplicate barangay names resolve to the right polygon.
+  const boundarySelection = React.useMemo<BoundarySelection | null>(() => {
+    if (filters.brgy && filters.city) {
+      return { level: "barangay", name: filters.brgy, city: filters.city };
+    }
+    if (filters.city) return { level: "city", name: filters.city };
+    if (filters.province) return { level: "province", name: filters.province };
+    return null;
+  }, [filters.brgy, filters.city, filters.province]);
+  const { data: boundaryHighlight } = useBoundaryFeature(boundarySelection);
+
   if (isLoading && !data) return <CustomerMapSkeleton />;
   if (error) return <ErrorPage message={error} onRefresh={refresh} />;
   if (data && !data.success) {
@@ -234,7 +291,7 @@ export default function CustomerMapPage() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3 p-2 sm:p-4 lg:p-5">
-      <div className="flex shrink-0 items-center justify-between gap-3">
+      <div className="flex shrink-0 flex-wrap items-center justify-between gap-x-3 gap-y-2">
         <div className="flex min-w-0 items-center gap-2.5">
           <div className="shrink-0 rounded-xl bg-primary/10 p-2">
             <MapPinned className="size-5 text-primary" />
@@ -258,21 +315,6 @@ export default function CustomerMapPage() {
           >
             <button
               type="button"
-              onClick={() => changeLayout("bar")}
-              aria-pressed={layout === "bar"}
-              title="Filter bar"
-              className={cn(
-                "flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium transition-colors",
-                layout === "bar"
-                  ? "bg-primary text-primary-foreground"
-                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
-              )}
-            >
-              <Rows3 className="size-3.5" />
-              <span>Bar</span>
-            </button>
-            <button
-              type="button"
               onClick={() => changeLayout("sidebar")}
               aria-pressed={layout === "sidebar"}
               title="Filter sidebar"
@@ -286,7 +328,29 @@ export default function CustomerMapPage() {
               <PanelLeft className="size-3.5" />
               <span>Sidebar</span>
             </button>
+            <button
+              type="button"
+              onClick={() => changeLayout("bar")}
+              aria-pressed={layout === "bar"}
+              title="Filter bar"
+              className={cn(
+                "flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium transition-colors",
+                layout === "bar"
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
+              )}
+            >
+              <Rows3 className="size-3.5" />
+              <span>Bar</span>
+            </button>
           </div>
+
+          <MapStyleSwitch
+            markerStyle={markerStyle}
+            onMarkerStyleChange={changeMarkerStyle}
+            basemap={basemap}
+            onBasemapChange={changeBasemap}
+          />
 
           <Button
             variant="outline"
@@ -325,6 +389,9 @@ export default function CustomerMapPage() {
               dealers={dealers}
               dealerStatuses={data?.dealerStatuses ?? []}
               perDealerCounts={perDealerCounts}
+              markerStyle={markerStyle}
+              basemap={basemap}
+              boundaryHighlight={boundaryHighlight}
             />
           </div>
         </div>
