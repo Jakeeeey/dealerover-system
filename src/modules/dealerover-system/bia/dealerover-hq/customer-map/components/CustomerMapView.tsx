@@ -9,13 +9,12 @@ import type {
   Map as MapLibreMap,
   MapMouseEvent,
 } from "maplibre-gl";
-import { Popover, PopoverTrigger } from "@/components/ui/popover";
-import { PopoverStageContent } from "./PopoverStageContent";
 import { cn, formatNumber } from "@/lib/utils";
 import type {
   CustomerMapBasemap,
   CustomerMapMarkerStyle,
   CustomerMapRow,
+  DealerLaneState,
   DealerStatus,
 } from "../types";
 import { MARKER_STROKE_COLOR } from "../utils/dealer-colors";
@@ -23,6 +22,20 @@ import { MARKER_STROKE_COLOR } from "../utils/dealer-colors";
 const SOURCE_ID = "customer-points";
 const HEAT_ID = "customer-heat";
 const CIRCLE_ID = "customer-points-circle";
+
+// Same-spot stack badges (dots view): customers within ~10 m share a grid
+// cell; exactly one anchor per cell of 2+ renders a white ring + "N" badge
+// above the dots so co-location is visible without switching to Clusters.
+const STACK_GRID_DEG = 0.00003; // ~3 m: only (near-)identical spots group
+const STACK_JITTER_RADIUS_DEG = 0.000045; // ~5 m fan-out radius for stacks
+
+// Clustered copy of the same point set (a second source — never `cluster:true`
+// on the dots source, or dots mode would break). Fed the same FeatureCollection
+// whenever the filtered set changes.
+const CLUSTER_SOURCE_ID = "customer-points-cluster";
+const CLUSTER_CIRCLE_ID = "customer-cluster-circles";
+const CLUSTER_COUNT_ID = "customer-cluster-count";
+const CLUSTER_POINT_ID = "customer-cluster-points";
 
 // Boundary highlight (selected province/city/barangay): a dark dim mask with
 // the selection cut out as holes, an accent tint over the selection, and a
@@ -115,6 +128,32 @@ interface CustomerFeatureProps {
   isActive: number;
 }
 
+/** Map selection: one customer (detail card) or several stacked at one spot (list). */
+type CustomerSelection =
+  | { kind: "single"; customer: CustomerFeatureProps }
+  | { kind: "list"; customers: CustomerFeatureProps[] };
+
+/** Type guard for a rendered cluster feature (carries point_count/cluster_id). */
+function isClusterFeature(properties: Record<string, unknown>): boolean {
+  return properties.cluster_id !== undefined && properties.cluster_id !== null;
+}
+
+/** Dedupes rendered hits by `properties.key` — a feature can repeat across tiles. */
+function dedupeHits(hits: { properties?: Record<string, unknown> | null }[]): Record<string, unknown>[] {
+  const seen = new Set<string>();
+  const unique: Record<string, unknown>[] = [];
+  for (const hit of hits) {
+    const props = hit.properties;
+    if (!props) continue;
+    // Cluster aggregates carry no customer key — keep them (deduped by cluster_id).
+    const key = typeof props.key === "string" ? props.key : `cluster:${String(props.cluster_id)}`;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    unique.push(props);
+  }
+  return unique;
+}
+
 interface CustomerMapViewProps {
   customers: CustomerMapRow[];
   dealers: DealerLegendItem[];
@@ -128,17 +167,56 @@ interface CustomerMapViewProps {
   selectedDealerIds: string[];
   /** Flips one dealer's membership in the filter (empty array = all). */
   onToggleDealer: (dealerId: string) => void;
+  /** Per-dealer streaming lane states — legend chips show a quiet progress
+   * hint while a lane is still running. Optional so the merged response shape
+   * keeps working on its own. */
+  dealerStates?: Record<string, DealerLaneState>;
 }
 
+/**
+ * Builds the render FeatureCollection. When `jitter` is true, customers that
+ * share the same ~10 m grid cell are fanned around their spot on a small ring
+ * (~15 m) so a stack reads as several distinct dots — sub-pixel when zoomed out
+ * (so it never clutters) and a visible rosette as you zoom in. Cluster/heat
+ * sources pass `jitter:false` so their aggregation uses the true positions.
+ */
 function buildMappableData(
   customers: CustomerMapRow[],
   colors: Record<string, string>,
+  jitter = false,
 ): MappableData {
+  const groups = new Map<string, number[]>();
+  customers.forEach((customer, index) => {
+    const gridKey = `${Math.floor(customer.lng / STACK_GRID_DEG)}:${Math.floor(customer.lat / STACK_GRID_DEG)}`;
+    const members = groups.get(gridKey);
+    if (members) members.push(index);
+    else groups.set(gridKey, [index]);
+  });
+
+  const latOffset = new Array<number>(customers.length).fill(0);
+  const lngOffset = new Array<number>(customers.length).fill(0);
+  if (jitter) {
+    for (const members of groups.values()) {
+      const count = members.length;
+      if (count < 2) continue;
+      for (let j = 0; j < count; j += 1) {
+        const index = members[j];
+        const angle = (2 * Math.PI * j) / count;
+        latOffset[index] = Math.sin(angle) * STACK_JITTER_RADIUS_DEG;
+        const cosLat = Math.cos((customers[index].lat * Math.PI) / 180) || 1;
+        lngOffset[index] = (Math.cos(angle) * STACK_JITTER_RADIUS_DEG) / cosLat;
+      }
+    }
+  }
+
   return {
     type: "FeatureCollection",
-    features: customers.map((customer) => ({
+    features: customers.map((customer, index) => ({
       type: "Feature",
-      geometry: { type: "Point", coordinates: [customer.lng, customer.lat] },
+      geometry: {
+        type: "Point",
+        coordinates: [customer.lng + lngOffset[index], customer.lat + latOffset[index]],
+      },
       properties: {
         key: customer.key,
         dealerId: customer.dealerId,
@@ -159,6 +237,46 @@ function buildMappableData(
       },
     })),
   } as MappableData;
+}
+
+type LngLatBounds = [[number, number], [number, number]];
+
+/** Bounding box of a boundary FeatureCollection's coordinates, or null. */
+function boundsOfHighlight(highlight: BoundaryHighlight | null | undefined): LngLatBounds | null {
+  if (!highlight || !Array.isArray(highlight.features) || highlight.features.length === 0) {
+    return null;
+  }
+  let minLng = Infinity;
+  let minLat = Infinity;
+  let maxLng = -Infinity;
+  let maxLat = -Infinity;
+  const visit = (coords: unknown): void => {
+    if (!Array.isArray(coords)) return;
+    if (typeof coords[0] === "number" && typeof coords[1] === "number") {
+      const lng = coords[0] as number;
+      const lat = coords[1] as number;
+      if (Number.isFinite(lng) && Number.isFinite(lat)) {
+        if (lng < minLng) minLng = lng;
+        if (lng > maxLng) maxLng = lng;
+        if (lat < minLat) minLat = lat;
+        if (lat > maxLat) maxLat = lat;
+      }
+      return;
+    }
+    for (const child of coords) visit(child);
+  };
+  for (const feature of highlight.features) {
+    visit(feature.geometry?.coordinates);
+  }
+  return Number.isFinite(minLng) &&
+    Number.isFinite(minLat) &&
+    Number.isFinite(maxLng) &&
+    Number.isFinite(maxLat)
+    ? [
+        [minLng, minLat],
+        [maxLng, maxLat],
+      ]
+    : null;
 }
 
 function DetailRow({ label, value }: { label: string; value: string }) {
@@ -492,16 +610,21 @@ function applyBoundaryLayers(map: MapLibreMap, highlight: BoundaryHighlight | nu
     });
   }
 
-  // Enforce bottom-to-top stacking: dim + tint under the points, glow above.
+  // Enforce bottom-to-top stacking: dim + tint wash the base map, then the border
+  // (glow + line + core), then heat + customer points ON TOP so the border never
+  // covers a data layer.
   for (const id of [
     DIM_ID,
     TINT_ID,
-    HEAT_ID,
-    CIRCLE_ID,
     GLOW_FAR_ID,
     GLOW_NEAR_ID,
     LINE_ID,
     CORE_ID,
+    HEAT_ID,
+    CIRCLE_ID,
+    CLUSTER_CIRCLE_ID,
+    CLUSTER_COUNT_ID,
+    CLUSTER_POINT_ID,
   ]) {
     try {
       if (map.getLayer(id)) map.moveLayer(id);
@@ -511,16 +634,31 @@ function applyBoundaryLayers(map: MapLibreMap, highlight: BoundaryHighlight | nu
   }
 }
 
-/** Max dealer chips rendered inline in the legend pill — anything beyond
- * this lives in the "+N" popover, so the pill stays contained at 375px. */
-const MAX_INLINE_DEALER_CHIPS = 4;
-
 interface DealerToggleProps {
   dealer: DealerLegendItem;
   count: number;
   offline: boolean;
   active: boolean;
+  /** Streaming lane state — drives the quiet per-dealer progress hint. */
+  state?: DealerLaneState;
   onToggle: () => void;
+}
+
+/**
+ * Progress hint for a dealer lane that is still streaming (existing chip
+ * styling + semantic tokens only). Counted in SCANNED rows so the numerator
+ * advances to its own denominator instead of stalling: `scanned / total` once
+ * page 0 reports the dealer's row count, otherwise `scanned…`, and "loading…"
+ * before the first page lands. Null once the lane settles, where the plotted
+ * count takes over and the gap becomes the coordinate-less disclosure.
+ */
+function streamingHint(state?: DealerLaneState): string | null {
+  if (!state || !state.loading) return null;
+  if (state.total !== undefined) {
+    return `${formatNumber(state.scanned)} / ${formatNumber(state.total)} scanned`;
+  }
+  if (state.scanned > 0) return `${formatNumber(state.scanned)} scanned…`;
+  return "loading…";
 }
 
 function DealerDot({ color }: { color: string }) {
@@ -533,8 +671,10 @@ function DealerDot({ color }: { color: string }) {
   );
 }
 
-/** Inline pill chip — a filter toggle (colour dot + name + count). */
-function DealerLegendChip({ dealer, count, offline, active, onToggle }: DealerToggleProps) {
+/** Legend chip — a filter toggle (colour dot + name + count). It fills its
+ * grid cell so the wrapping legend area stays tidy at any dealer count. */
+function DealerLegendChip({ dealer, count, offline, active, state, onToggle }: DealerToggleProps) {
+  const hint = streamingHint(state);
   return (
     <button
       type="button"
@@ -542,33 +682,7 @@ function DealerLegendChip({ dealer, count, offline, active, onToggle }: DealerTo
       aria-pressed={active}
       title={`${dealer.name} — ${active ? "click to hide" : "click to show"}`}
       className={cn(
-        "flex shrink-0 items-center gap-2 rounded-full border border-border px-2.5 py-1 text-xs transition-colors hover:bg-accent",
-        !active && "opacity-50",
-      )}
-    >
-      <DealerDot color={dealer.color} />
-      <span className="max-w-[110px] truncate" title={dealer.name}>
-        {dealer.name}
-      </span>
-      {offline ? (
-        <span className="font-medium text-destructive">offline</span>
-      ) : (
-        <span className="tabular-nums text-muted-foreground">{formatNumber(count)}</span>
-      )}
-    </button>
-  );
-}
-
-/** Full-width row inside the "+N" popover — same toggle, room for long names. */
-function DealerLegendRow({ dealer, count, offline, active, onToggle }: DealerToggleProps) {
-  return (
-    <button
-      type="button"
-      onClick={onToggle}
-      aria-pressed={active}
-      title={`${dealer.name} — ${active ? "click to hide" : "click to show"}`}
-      className={cn(
-        "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-xs transition-colors hover:bg-accent",
+        "flex w-full min-w-0 items-center gap-2 rounded-lg border border-border px-2.5 py-1 text-xs transition-colors hover:bg-accent",
         !active && "opacity-50",
       )}
     >
@@ -577,9 +691,22 @@ function DealerLegendRow({ dealer, count, offline, active, onToggle }: DealerTog
         {dealer.name}
       </span>
       {offline ? (
-        <span className="shrink-0 font-medium text-destructive">offline</span>
+        <span className="font-medium text-destructive">offline</span>
+      ) : hint !== null ? (
+        <span className="tabular-nums text-muted-foreground" title="Still loading this dealer">
+          {hint}
+        </span>
       ) : (
-        <span className="shrink-0 tabular-nums text-muted-foreground">{formatNumber(count)}</span>
+        <span
+          className="tabular-nums text-muted-foreground"
+          title={
+            state && state.withoutLocation > 0
+              ? `${formatNumber(state.scanned)} scanned · ${formatNumber(state.withoutLocation)} without coordinates`
+              : undefined
+          }
+        >
+          {formatNumber(count)}
+        </span>
       )}
     </button>
   );
@@ -595,13 +722,14 @@ export function CustomerMapView({
   boundaryHighlight = null,
   selectedDealerIds,
   onToggleDealer,
+  dealerStates = {},
 }: CustomerMapViewProps) {
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const mapRef = React.useRef<MapLibreMap | null>(null);
   const appliedBasemapRef = React.useRef<CustomerMapBasemap | null>(null);
   const initialBasemapRef = React.useRef(basemap);
   const [mapReady, setMapReady] = React.useState(false);
-  const [selected, setSelected] = React.useState<CustomerFeatureProps | null>(null);
+  const [selected, setSelected] = React.useState<CustomerSelection | null>(null);
   const [legendOpen, setLegendOpen] = React.useState(true);
 
   const colors = React.useMemo(() => {
@@ -624,9 +752,6 @@ export function CustomerMapView({
   // Empty selection = all dealers shown, so every chip reads active.
   const isDealerActive = (dealerId: string) =>
     selectedDealerIds.length === 0 || selectedDealerIds.includes(dealerId);
-  const inlineDealers = dealers.slice(0, MAX_INLINE_DEALER_CHIPS);
-  const overflowCount = dealers.length - inlineDealers.length;
-
   // Latest render values for the map's style/event callbacks (which outlive renders).
   const latest = React.useRef({
     customers,
@@ -643,10 +768,28 @@ export function CustomerMapView({
   const applyLayers = React.useCallback((map: MapLibreMap) => {
     const state = latest.current;
     try {
-      const data = buildMappableData(state.customers, state.colors);
+      // Dots fan stacked customers out (jitter); clusters keep true positions.
+      const data = buildMappableData(state.customers, state.colors, true);
+      const clusterData = buildMappableData(state.customers, state.colors, false);
       const existing = map.getSource(SOURCE_ID) as GeoJSONSource | undefined;
       if (!existing) map.addSource(SOURCE_ID, { type: "geojson", data });
       else existing.setData(data);
+
+      // Clustered twin of the dots source — MapLibre aggregates nearby points
+      // into point_count clusters, using the TRUE positions (no jitter). Kept as
+      // a separate source so the dots source stays unclustered for dots/heatmap.
+      const existingCluster = map.getSource(CLUSTER_SOURCE_ID) as GeoJSONSource | undefined;
+      if (!existingCluster) {
+        map.addSource(CLUSTER_SOURCE_ID, {
+          type: "geojson",
+          data: clusterData,
+          cluster: true,
+          clusterRadius: 44,
+          clusterMaxZoom: 14,
+        });
+      } else {
+        existingCluster.setData(clusterData);
+      }
 
       if (!map.getLayer(HEAT_ID)) {
         map.addLayer({
@@ -655,18 +798,18 @@ export function CustomerMapView({
           source: SOURCE_ID,
           paint: {
             "heatmap-weight": 1,
-            "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 5, 0.8, 12, 2.5],
-            "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 5, 14, 12, 30],
+            "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 5, 0.5, 12, 1.1],
+            "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 5, 18, 12, 34],
             "heatmap-opacity": 0.85,
             "heatmap-color": [
               "interpolate",
               ["linear"],
               ["heatmap-density"],
               0, "rgba(37,99,235,0)",
-              0.2, "rgba(37,99,235,0.55)",
-              0.4, "#22c55e",
-              0.6, "#eab308",
-              0.8, "#f97316",
+              0.28, "rgba(37,99,235,0.55)",
+              0.5, "#22c55e",
+              0.7, "#eab308",
+              0.88, "#f97316",
               1, "#ef4444",
             ],
           },
@@ -688,12 +831,67 @@ export function CustomerMapView({
         });
       }
 
+      if (!map.getLayer(CLUSTER_CIRCLE_ID)) {
+        map.addLayer({
+          id: CLUSTER_CIRCLE_ID,
+          type: "circle",
+          source: CLUSTER_SOURCE_ID,
+          filter: ["has", "point_count"],
+          paint: {
+            // Canvas paints (see resolveAccentColor) — explicit Okabe–Ito-ish
+            // steps by cluster size; theme tokens cannot reach WebGL.
+            "circle-color": ["step", ["get", "point_count"], "#0072B2", 10, "#E69F00", 50, "#D55E00"],
+            "circle-radius": ["step", ["get", "point_count"], 15, 10, 20, 50, 26],
+            "circle-opacity": 0.85,
+            "circle-stroke-color": MARKER_STROKE_COLOR,
+            "circle-stroke-width": 1.5,
+          },
+        });
+      }
+
+      if (!map.getLayer(CLUSTER_COUNT_ID)) {
+        map.addLayer({
+          id: CLUSTER_COUNT_ID,
+          type: "symbol",
+          source: CLUSTER_SOURCE_ID,
+          filter: ["has", "point_count"],
+          layout: {
+            "text-field": ["get", "point_count_abbreviated"],
+            "text-size": 12,
+          },
+          // No text-font: the OpenFreeMap styles supply the glyphs and MapLibre
+          // falls back to the style default — an invented stack would break labels.
+          paint: { "text-color": "#ffffff" },
+        });
+      }
+
+      if (!map.getLayer(CLUSTER_POINT_ID)) {
+        map.addLayer({
+          id: CLUSTER_POINT_ID,
+          type: "circle",
+          source: CLUSTER_SOURCE_ID,
+          filter: ["!", ["has", "point_count"]],
+          paint: {
+            "circle-color": ["get", "color"],
+            "circle-radius": ["interpolate", ["linear"], ["zoom"], 4, 3, 8, 5, 12, 7, 16, 10],
+            "circle-stroke-color": MARKER_STROKE_COLOR,
+            "circle-stroke-width": 1,
+            "circle-opacity": 0.9,
+          },
+        });
+      }
+
       const show = (id: string, visible: boolean) => {
         if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visible ? "visible" : "none");
       };
       const isHeat = state.markerStyle === "heatmap";
+      const isClusters = state.markerStyle === "clusters";
+      const isDots = !isHeat && !isClusters;
       show(HEAT_ID, isHeat);
-      show(CIRCLE_ID, !isHeat);
+      show(CIRCLE_ID, isDots);
+      show(CLUSTER_CIRCLE_ID, isClusters);
+      show(CLUSTER_COUNT_ID, isClusters);
+      show(CLUSTER_POINT_ID, isClusters);
 
       applyBoundaryLayers(map, state.boundaryHighlight);
     } catch {
@@ -727,11 +925,74 @@ export function CustomerMapView({
       instance.addControl(new maplibregl.ScaleControl({ maxWidth: 100 }), "bottom-left");
 
       // Generic handlers survive style swaps (layer-bound handlers do not).
-      const hitLayers = (): string[] => [CIRCLE_ID].filter((id) => instance.getLayer(id));
+      // Hit layers follow the active style: dots read the plain circle layer,
+      // clusters read the cluster aggregates + unclustered points, heatmap has
+      // no clickable features.
+      const hitLayers = (): string[] => {
+        const style = latest.current.markerStyle;
+        if (style === "heatmap") return [];
+        const ids =
+          style === "clusters" ? [CLUSTER_CIRCLE_ID, CLUSTER_POINT_ID] : [CIRCLE_ID];
+        return ids.filter((id) => {
+          try {
+            return Boolean(instance.getLayer(id));
+          } catch {
+            return false;
+          }
+        });
+      };
       instance.on("click", (event: MapMouseEvent) => {
-        const layers = hitLayers();
-        const hits = layers.length ? instance.queryRenderedFeatures(event.point, { layers }) : [];
-        setSelected(hits.length ? (hits[0].properties as unknown as CustomerFeatureProps) : null);
+        void (async () => {
+          const layers = hitLayers();
+          if (layers.length === 0) {
+            setSelected(null);
+            return;
+          }
+          const hits = instance.queryRenderedFeatures(event.point, { layers });
+          const unique = dedupeHits(hits);
+          if (unique.length === 0) {
+            setSelected(null);
+            return;
+          }
+          // A cluster aggregate expands to its leaf customers via the source.
+          const clusterHit = unique.find((props) => isClusterFeature(props));
+          if (clusterHit) {
+            const clusterId = Number(clusterHit.cluster_id);
+            try {
+              const source = instance.getSource(CLUSTER_SOURCE_ID) as
+                | GeoJSONSource
+                | undefined;
+              const leaves =
+                source && typeof source.getClusterLeaves === "function"
+                  ? await source.getClusterLeaves(clusterId, Infinity, 0)
+                  : [];
+              const leafProps = dedupeHits(
+                leaves.map((leaf) => ({
+                  properties: (leaf.properties ?? {}) as Record<string, unknown>,
+                })),
+              );
+              const leafCustomers = leafProps.filter(
+                (props) => typeof props.key === "string",
+              ) as unknown as CustomerFeatureProps[];
+              if (leafCustomers.length > 1) {
+                setSelected({ kind: "list", customers: leafCustomers });
+                return;
+              }
+              if (leafCustomers.length === 1) {
+                setSelected({ kind: "single", customer: leafCustomers[0] });
+                return;
+              }
+            } catch {
+              // Cluster expansion failed — fall through to the point hits below.
+            }
+          }
+          const points = unique.filter(
+            (props) => typeof props.key === "string",
+          ) as unknown as CustomerFeatureProps[];
+          if (points.length > 1) setSelected({ kind: "list", customers: points });
+          else if (points.length === 1) setSelected({ kind: "single", customer: points[0] });
+          else setSelected(null);
+        })();
       });
       instance.on("mousemove", (event: MapMouseEvent) => {
         const layers = hitLayers();
@@ -794,10 +1055,26 @@ export function CustomerMapView({
   React.useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
-    setSelected((previous) =>
-      previous && customers.some((customer) => customer.key === previous.key) ? previous : null,
-    );
-    if (customers.length > 0) {
+    setSelected((previous) => {
+      if (!previous) return previous;
+      if (previous.kind === "single") {
+        return customers.some((customer) => customer.key === previous.customer.key)
+          ? previous
+          : null;
+      }
+      const remaining = previous.customers.filter((choice) =>
+        customers.some((customer) => customer.key === choice.key),
+      );
+      if (remaining.length === 0) return null;
+      return remaining.length === previous.customers.length
+        ? previous
+        : { kind: "list", customers: remaining };
+    });
+    // Prefer the selected boundary's extent (a Location filter) so the whole
+    // province / city / barangay is framed; fall back to the customers' extent
+    // for attribute-only filters.
+    let bounds = boundsOfHighlight(boundaryHighlight);
+    if (!bounds && customers.length > 0) {
       let minLng = Infinity;
       let minLat = Infinity;
       let maxLng = -Infinity;
@@ -808,15 +1085,24 @@ export function CustomerMapView({
         minLat = Math.min(minLat, customer.lat);
         maxLat = Math.max(maxLat, customer.lat);
       }
-      map.fitBounds(
-        [
-          [minLng, minLat],
-          [maxLng, maxLat],
-        ],
-        { padding: 56, maxZoom: 12, duration: 500 },
-      );
+      bounds = [
+        [minLng, minLat],
+        [maxLng, maxLat],
+      ];
     }
-  }, [customers, mapReady]);
+    if (bounds) {
+      // The zoom ceiling is high so small cities / barangays still fill the view
+      // (vector tiles overzoom crisply); the left padding keeps the region clear
+      // of the floating sidebar on desktop.
+      const sidebarInset =
+        typeof window !== "undefined" && window.innerWidth >= 1024 ? 336 : 0;
+      map.fitBounds(bounds, {
+        padding: { top: 72, bottom: 72, left: 56 + sidebarInset, right: 56 },
+        maxZoom: 18,
+        duration: 600,
+      });
+    }
+  }, [customers, boundaryHighlight, mapReady]);
 
   // Full-bleed stage: the map is the base layer (z-0) and every strip is a
   // floating glass overlay — offline pill top-center (z-10), legend pill
@@ -860,22 +1146,22 @@ export function CustomerMapView({
         </div>
       )}
 
-      {selected && (
+      {selected?.kind === "single" && (
         <div className="absolute right-3 top-[4.5rem] z-30 w-[min(20rem,calc(100%-1.5rem))]">
           <div className="rounded-xl border border-border/60 bg-card/85 p-4 shadow-lg backdrop-blur-md">
               <div className="flex items-start justify-between gap-3">
                 <div className="flex min-w-0 items-start gap-2">
-                  <MapPin className="mt-0.5 size-4 shrink-0" style={{ color: selected.color }} />
+                  <MapPin className="mt-0.5 size-4 shrink-0" style={{ color: selected.customer.color }} />
                   <div className="min-w-0">
                     <p
                       className="truncate text-sm font-semibold"
-                      title={selected.storeName || selected.customerName}
+                      title={selected.customer.storeName || selected.customer.customerName}
                     >
-                      {selected.storeName || selected.customerName || "Customer"}
+                      {selected.customer.storeName || selected.customer.customerName || "Customer"}
                     </p>
-                    <p className="truncate text-xs text-muted-foreground" title={selected.customerCode}>
-                      {selected.customerName}
-                      {selected.customerCode ? ` · ${selected.customerCode}` : ""}
+                    <p className="truncate text-xs text-muted-foreground" title={selected.customer.customerCode}>
+                      {selected.customer.customerName}
+                      {selected.customer.customerCode ? ` · ${selected.customer.customerCode}` : ""}
                     </p>
                   </div>
                 </div>
@@ -891,94 +1177,140 @@ export function CustomerMapView({
               </div>
 
               <div className="mt-3 space-y-1.5 border-t pt-3">
-                <DetailRow label="Dealer" value={selected.dealerName} />
-                <DetailRow label="Store type" value={selected.storeType} />
-                <DetailRow label="Class" value={selected.classification} />
+                <DetailRow label="Dealer" value={selected.customer.dealerName} />
+                <DetailRow label="Store type" value={selected.customer.storeType} />
+                <DetailRow label="Class" value={selected.customer.classification} />
                 <DetailRow
                   label="City"
-                  value={[selected.city, selected.province].filter(Boolean).join(", ")}
+                  value={[selected.customer.city, selected.customer.province].filter(Boolean).join(", ")}
                 />
-                <DetailRow label="Barangay" value={selected.brgy} />
-                <DetailRow label="Price type" value={selected.priceType} />
-                <DetailRow label="Payment term" value={selected.paymentTerm} />
+                <DetailRow label="Barangay" value={selected.customer.brgy} />
+                <DetailRow label="Price type" value={selected.customer.priceType} />
+                <DetailRow label="Payment term" value={selected.customer.paymentTerm} />
               </div>
             </div>
           </div>
         )}
 
-      {/* Dealer legend pill — floats bottom-center. The total is plain text;
-          each chip is a filter toggle (colour dot + name + count). At most 4
-          chips render inline; the rest live in a "+N" popover, so the pill
-          stays contained instead of scrolling endlessly. */}
-      <div className="absolute bottom-3 left-1/2 z-10 flex max-w-[calc(100%-1.5rem)] -translate-x-1/2 items-center gap-2 overflow-hidden rounded-xl border border-border/60 bg-card/85 px-3 py-2 shadow-lg backdrop-blur-md">
-        <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground">
-          <span className="font-semibold tabular-nums text-foreground">
-            {formatNumber(customers.length)}
-          </span>{" "}
-          plotted
-        </span>
+      {/* Stacked-spot list: every customer rendered at the clicked point or
+          inside the clicked cluster. Picking a row opens that customer's card. */}
+      {selected?.kind === "list" && (
+        <div className="absolute right-3 top-[4.5rem] z-30 w-[min(20rem,calc(100%-1.5rem))]">
+          <div className="rounded-xl border border-border/60 bg-card/85 p-4 shadow-lg backdrop-blur-md">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="truncate text-sm font-semibold" title={`${selected.customers.length} customers at this location`}>
+                  <span className="tabular-nums">{formatNumber(selected.customers.length)}</span>{" "}
+                  customers at this location
+                </p>
+                <p className="truncate text-xs text-muted-foreground">
+                  Select one to see details
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSelected(null)}
+                className="flex size-9 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                aria-label="Close customer list"
+                title="Close customer list"
+              >
+                <X className="size-4" />
+              </button>
+            </div>
 
-        {dealers.length > 0 && (
-          <>
+            <ul className="mt-3 max-h-64 space-y-1 overflow-y-auto border-t pt-3">
+              {selected.customers.map((customer) => (
+                <li key={customer.key}>
+                  <button
+                    type="button"
+                    onClick={() => setSelected({ kind: "single", customer })}
+                    className="flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent"
+                    aria-label={`Show details for ${customer.storeName || customer.customerName}`}
+                    title={customer.storeName || customer.customerName}
+                  >
+                    <span
+                      className="size-2.5 shrink-0 rounded-full ring-1 ring-border"
+                      style={{ backgroundColor: customer.color }}
+                      aria-hidden
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span
+                        className="block truncate text-xs font-medium"
+                        title={customer.storeName || customer.customerName}
+                      >
+                        {customer.storeName || customer.customerName || "Customer"}
+                      </span>
+                      <span
+                        className="block truncate text-xs tabular-nums text-muted-foreground"
+                        title={[customer.customerName, customer.customerCode].filter(Boolean).join(" · ")}
+                      >
+                        {customer.customerName}
+                        {customer.customerCode ? ` · ${customer.customerCode}` : ""}
+                      </span>
+                      <span className="block truncate text-[11px] text-muted-foreground" title={customer.dealerName}>
+                        {customer.dealerName}
+                      </span>
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
+
+      {/* Dealer legend — floats bottom-center. The header line stays put (total
+          + the coordinate-less disclosure + the toggle); the dealer chips live
+          in a bounded, wrapping, vertically-scrollable area beneath it, so the
+          legend scales to any number of dealers without a horizontal scroll. */}
+      <div
+        className={cn(
+          "absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 flex-col gap-2 rounded-xl border border-border/60 bg-card/85 px-3 py-2 shadow-lg backdrop-blur-md",
+          legendOpen && dealers.length > 0
+            ? "w-[min(560px,calc(100%-1.5rem))]"
+            : "max-w-[calc(100%-1.5rem)]",
+        )}
+      >
+        <div className="flex min-w-0 items-center gap-2">
+          <span
+            className="shrink-0 text-xs text-muted-foreground"
+            title="Customers with coordinates that pass the current filters — these are the dots on the map."
+          >
+            <span className="font-semibold tabular-nums text-foreground">
+              {formatNumber(customers.length)}
+            </span>{" "}
+            plotted
+          </span>
+
+          {dealers.length > 0 && (
             <button
               type="button"
               onClick={() => setLegendOpen((open) => !open)}
-              className="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              className="ml-auto flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
               aria-label={legendOpen ? "Hide dealer legend" : "Show dealer legend"}
               title={legendOpen ? "Hide dealer legend" : "Show dealer legend"}
               aria-expanded={legendOpen}
             >
               {legendOpen ? <ChevronUp className="size-4" /> : <ChevronDown className="size-4" />}
             </button>
+          )}
+        </div>
 
-            {legendOpen && (
-              <>
-                <span className="h-4 w-px shrink-0 bg-border" aria-hidden />
-                <ul className="flex min-w-0 items-center gap-1.5 overflow-x-auto">
-                  {inlineDealers.map((dealer) => (
-                    <li key={dealer.id} className="shrink-0">
-                      <DealerLegendChip
-                        dealer={dealer}
-                        count={perDealerCounts[dealer.id] ?? 0}
-                        offline={offlineDealerIds.has(dealer.id)}
-                        active={isDealerActive(dealer.id)}
-                        onToggle={() => onToggleDealer(dealer.id)}
-                      />
-                    </li>
-                  ))}
-                </ul>
-                {overflowCount > 0 && (
-                  <Popover>
-                    <PopoverTrigger asChild>
-                      <button
-                        type="button"
-                        className="shrink-0 rounded-full border border-border px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                        aria-label={`Show ${overflowCount} more dealers`}
-                        title={`Show ${overflowCount} more dealers`}
-                      >
-                        +{overflowCount}
-                      </button>
-                    </PopoverTrigger>
-                    <PopoverStageContent side="top" align="center" className="w-[260px] p-1">
-                      <ul className="max-h-64 overflow-y-auto overscroll-contain">
-                        {dealers.map((dealer) => (
-                          <li key={dealer.id}>
-                            <DealerLegendRow
-                              dealer={dealer}
-                              count={perDealerCounts[dealer.id] ?? 0}
-                              offline={offlineDealerIds.has(dealer.id)}
-                              active={isDealerActive(dealer.id)}
-                              onToggle={() => onToggleDealer(dealer.id)}
-                            />
-                          </li>
-                        ))}
-                      </ul>
-                    </PopoverStageContent>
-                  </Popover>
-                )}
-              </>
-            )}
-          </>
+        {legendOpen && dealers.length > 0 && (
+          <ul className="flex max-h-28 flex-wrap gap-1.5 overflow-y-auto overscroll-contain sm:max-h-40">
+            {dealers.map((dealer) => (
+              <li key={dealer.id} className="min-w-0 grow basis-40 max-w-64">
+                <DealerLegendChip
+                  dealer={dealer}
+                  count={perDealerCounts[dealer.id] ?? 0}
+                  offline={offlineDealerIds.has(dealer.id)}
+                  active={isDealerActive(dealer.id)}
+                  state={dealerStates[dealer.id]}
+                  onToggle={() => onToggleDealer(dealer.id)}
+                />
+              </li>
+            ))}
+          </ul>
         )}
       </div>
     </div>

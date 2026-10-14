@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import {
+  Boxes,
   Check,
   CircleDot,
   Droplet,
@@ -34,6 +35,7 @@ interface BasemapOption {
 const MARKER_OPTIONS: MarkerOption[] = [
   { value: "dots", label: "Dots", icon: CircleDot },
   { value: "heatmap", label: "Heatmap", icon: Flame },
+  { value: "clusters", label: "Clusters", icon: Boxes },
 ];
 
 // Liberty first — it is the default selection.
@@ -53,7 +55,7 @@ interface MapStyleSwitchProps {
 }
 
 /**
- * Map presentation controls: how points are drawn (dots / heatmap) and which
+ * Map presentation controls: how points are drawn (dots / heatmap / clusters) and which
  * basemap style to use. Both are persisted user preferences.
  */
 export function MapStyleSwitch({

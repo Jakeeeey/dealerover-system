@@ -225,17 +225,21 @@ function PaymentTermField({
 
 function SearchField({ filters, onChange, disabled, stacked }: FieldProps) {
   return (
-    <div className={cn("relative", stacked && "w-full")}>
+    <div className={stacked ? "w-full" : undefined}>
       <label className={labelClass(stacked)}>Search</label>
-      <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-      <Input
-        value={filters.search}
-        onChange={(event) => onChange({ search: event.target.value })}
-        placeholder="Search name, code, store"
-        className={cn("h-8 pl-8 text-xs", stacked ? "w-full" : "w-56")}
-        aria-label="Search customers"
-        disabled={disabled}
-      />
+      {/* The relative wrapper covers ONLY the input, so the icon centers on the
+          field — not on the label + input together. */}
+      <div className="relative">
+        <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          value={filters.search}
+          onChange={(event) => onChange({ search: event.target.value })}
+          placeholder="Search name, code, store"
+          className={cn("h-8 pl-8 text-xs", stacked ? "w-full" : "w-56")}
+          aria-label="Search customers"
+          disabled={disabled}
+        />
+      </div>
     </div>
   );
 }

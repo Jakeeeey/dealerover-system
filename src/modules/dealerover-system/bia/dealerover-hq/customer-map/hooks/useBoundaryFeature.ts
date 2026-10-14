@@ -11,6 +11,8 @@ export interface BoundarySelection {
   name: string;
   /** Parent city — disambiguates duplicate barangay names. */
   city?: string;
+  /** Parent province — disambiguates duplicate city/barangay names. */
+  province?: string;
 }
 
 interface BoundaryState {
@@ -29,10 +31,14 @@ export function useBoundaryFeature(selection: BoundarySelection | null) {
   const level = selection?.level ?? null;
   const name = selection?.name ?? "";
   const city = selection?.city ?? "";
+  const province = selection?.province ?? "";
 
   // Empty key = no selection. The state resets during render (the sanctioned
   // "adjust state during render" pattern) so no effect-time setState is needed.
-  const key = level && name.trim() ? `${level}|${name.trim()}|${city.trim()}` : "";
+  const key =
+    level && name.trim()
+      ? `${level}|${name.trim()}|${city.trim()}|${province.trim()}`
+      : "";
   const [state, setState] = useState<BoundaryState>({ key, data: null, isLoading: key !== "" });
   if (state.key !== key) {
     setState({ key, data: null, isLoading: key !== "" });
@@ -41,7 +47,9 @@ export function useBoundaryFeature(selection: BoundarySelection | null) {
   useEffect(() => {
     if (!key || !level || !name.trim()) return;
     const controller = new AbortController();
-    const args = { level, name: name.trim(), city: city.trim() };
+    const args: BoundarySelection = { level, name: name.trim() };
+    if (city.trim()) args.city = city.trim();
+    if (province.trim()) args.province = province.trim();
 
     getBoundaryFeature(args, controller.signal)
       .then((payload) => {
@@ -55,7 +63,7 @@ export function useBoundaryFeature(selection: BoundarySelection | null) {
       });
 
     return () => controller.abort();
-  }, [key, level, name, city]);
+  }, [key, level, name, city, province]);
 
   return { data: state.key === key ? state.data : null, isLoading: state.key === key && state.isLoading };
 }
