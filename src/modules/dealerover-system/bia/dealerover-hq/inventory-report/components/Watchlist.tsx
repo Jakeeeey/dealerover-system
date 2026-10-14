@@ -1,20 +1,10 @@
 "use client";
 
 import { ChevronRight } from "lucide-react";
-import { StatusBadge, type StatusTone } from "@/components/ui/status-badge";
-import { formatCurrency, formatNumber } from "@/lib/utils";
-import type { LowStockState } from "../types";
+import { StatusBadge } from "@/components/ui/status-badge";
+import { cn, formatCurrency, formatNumber } from "@/lib/utils";
+import { CELL_WASH, STATE_LABEL, STRIP_BG, TONE_BY_STATE } from "../utils/severity-tone";
 import type { ProductAggregate } from "../utils/aggregate";
-
-const TONE_BY_STATE: Record<LowStockState, StatusTone> = {
-  out: "destructive",
-  critical: "destructive",
-  low: "warning",
-  watch: "info",
-  healthy: "success",
-  overstock: "neutral",
-  dead: "neutral",
-};
 
 interface WatchlistProps {
   items: ProductAggregate[];
@@ -36,7 +26,6 @@ function displayUnitsLabel(onHand: number, unitCount: number, unitName?: string)
   return `${text} ${unit}`;
 }
 
-/** Prose watchlist rows, each jumping to the item drawer. */
 export function Watchlist({ items, onSelect }: WatchlistProps) {
   if (items.length === 0) {
     return (
@@ -50,18 +39,32 @@ export function Watchlist({ items, onSelect }: WatchlistProps) {
   }
 
   return (
-    <ul className="divide-y rounded-xl border">
-      {items.map((item) => (
-        <li key={item.key}>
+    <ul className="overflow-hidden rounded-xl border">
+      {items.map((item, index) => (
+        <li key={item.key} className="border-b last:border-b-0">
           <button
             type="button"
             onClick={() => onSelect(item.dealerId, item.productId)}
-            className="flex w-full items-center gap-3 px-3 py-2.5 text-left transition-[background-color,opacity] duration-150 hover:bg-muted/60 focus-visible:outline-2 focus-visible:outline-ring"
+            aria-label={`Rank ${index + 1}: ${item.dealerName} is low on ${item.productName}, ${STATE_LABEL[item.state]}`}
+            className="relative flex w-full items-center gap-2.5 py-2.5 pl-4 pr-3 text-left transition-[background-color,opacity] duration-150 hover:bg-muted/60 focus-visible:outline-2 focus-visible:outline-ring sm:gap-3"
           >
+            <span
+              aria-hidden
+              className={cn("absolute inset-y-1.5 left-0 w-1 rounded-r-full", STRIP_BG[item.state])}
+            />
+            <span
+              aria-hidden
+              className={cn(
+                "flex size-7 shrink-0 items-center justify-center rounded-full text-[11px] font-black tabular-nums",
+                CELL_WASH[item.state],
+              )}
+            >
+              {index + 1}
+            </span>
             <StatusBadge tone={TONE_BY_STATE[item.state]} className="shrink-0">
-              {item.state}
+              {STATE_LABEL[item.state]}
             </StatusBadge>
-            <span className="min-w-0 flex-1 text-xs leading-snug sm:text-[13px]">
+            <span className="min-w-0 flex-1 text-xs tabular-nums leading-snug sm:text-[13px]">
               <span className="font-medium">{item.dealerName}</span>
               <span className="text-muted-foreground"> is {item.state === "out" ? "out of " : "low on "}</span>
               <span className="font-medium">{item.productName}</span>
@@ -72,6 +75,12 @@ export function Watchlist({ items, onSelect }: WatchlistProps) {
                 {item.effectiveMin > 0 ? `, minimum ${displayUnitsLabel(item.effectiveMin, item.unitCount, item.unitName)}` : ""} ·{" "}
                 {formatCurrency(item.value)} at risk
               </span>
+            </span>
+            <span
+              className="hidden max-w-32 shrink-0 truncate rounded-md border px-1.5 py-0.5 text-[10px] text-muted-foreground md:block"
+              title={item.reason}
+            >
+              {item.reason}
             </span>
             <span className="hidden shrink-0 text-[11px] tabular-nums text-muted-foreground sm:block">
               {formatNumber(item.onHand, "en-PH", 0)} pcs

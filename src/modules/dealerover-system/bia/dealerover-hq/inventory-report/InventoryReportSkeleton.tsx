@@ -2,10 +2,9 @@
 
 import { Skeleton } from "@/components/ui/skeleton";
 
-/** Loading placeholder shaped like the header, KPI strip, board, and watchlist. */
 export function InventoryReportSkeleton() {
   return (
-    <div className="mx-auto min-h-screen w-full max-w-[1600px] space-y-4 p-2 sm:p-6 md:p-10">
+    <div className="mx-auto min-h-screen w-full max-w-[1600px] space-y-6 p-2 sm:p-6 md:p-10">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="space-y-2">
           <Skeleton className="h-7 w-56" />
@@ -18,10 +17,12 @@ export function InventoryReportSkeleton() {
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-2 sm:gap-3 lg:grid-cols-5">
-        {Array.from({ length: 5 }).map((_, i) => (
-          <Skeleton key={i} className="h-[68px] rounded-xl" />
-        ))}
+      <Skeleton className="h-28 w-full rounded-2xl sm:h-32" />
+
+      <div className="grid gap-2 sm:gap-3 md:grid-cols-3">
+        <Skeleton className="h-36 rounded-lg" />
+        <Skeleton className="h-44 rounded-lg" />
+        <Skeleton className="h-36 rounded-lg" />
       </div>
 
       <div className="space-y-2">

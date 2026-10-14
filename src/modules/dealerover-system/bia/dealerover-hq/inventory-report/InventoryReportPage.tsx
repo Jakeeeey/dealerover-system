@@ -1,18 +1,22 @@
 "use client";
 
 import * as React from "react";
-import { Package, RefreshCw } from "lucide-react";
+import { RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
+import { StatusBadge } from "@/components/ui/status-badge";
 import { cn } from "@/lib/utils";
 import { ErrorPage } from "@/app/(dealerover-system)/dealerover-system/_components/ErrorPage";
 import { DealerFilterCombobox } from "@/modules/dealerover-system/bia/dealerover-hq/customer-map/components/FilterCombobox";
 import { getDealerColor } from "@/modules/dealerover-system/bia/dealerover-hq/customer-map/utils/dealer-colors";
+import { DealeroverEmblemPreloader } from "@/modules/dealerover-system/bia/dealerover-hq/leaderboard/components/dealerover-emblem-preloader";
+import { triggerRankConfetti } from "@/modules/dealerover-system/bia/dealerover-hq/leaderboard/components/rank-confetti";
 import type { InventoryRow } from "./types";
 import { useInventoryReport } from "./hooks/useInventoryReport";
 import { useLowStockPolicy } from "./hooks/useLowStockPolicy";
 import { buildProductAggregates, SEVERITY_RANK } from "./utils/aggregate";
-import { KpiTiles } from "./components/KpiTiles";
+import { HeroBand } from "./components/HeroBand";
+import { UrgencyPodium } from "./components/UrgencyPodium";
 import { LowStockBoard } from "./components/LowStockBoard";
 import { Watchlist } from "./components/Watchlist";
 import { ItemDrawer, type ItemDrawerSelection } from "./components/ItemDrawer";
@@ -48,12 +52,6 @@ function readStoredFilters(): FilterState {
   }
 }
 
-/**
- * DealerOver HQ — Inventory Report.
- *
- * Owns filter state (dealer scope, zero-stock, demand window), the low-stock
- * policy, and the item-drill selection. Filter + policy persist to localStorage.
- */
 export default function InventoryReportPage() {
   const [filters, setFilters] = React.useState<FilterState>(DEFAULT_FILTERS);
   const [selection, setSelection] = React.useState<ItemDrawerSelection | null>(null);
@@ -65,7 +63,6 @@ export default function InventoryReportPage() {
   );
   const { data, isLoading, error, refresh, dealerStates } = useInventoryReport(query);
 
-  // Hydrate persisted filters once (validated like CustomerMapPage).
   React.useEffect(() => {
     setFilters(readStoredFilters());
   }, []);
@@ -79,9 +76,6 @@ export default function InventoryReportPage() {
     }
   }, []);
 
-  // Keep the demand window single-sourced: the filter drives the fetch and the
-  // severity math, while the policy hook persists the same value. (The report
-  // hook refetches itself when the query changes, so no manual refresh here.)
   React.useEffect(() => {
     if (policy.policy.windowDays !== filters.windowDays) {
       policy.setWindowDays(filters.windowDays);
@@ -106,8 +100,6 @@ export default function InventoryReportPage() {
   const dealers = React.useMemo(() => {
     const seen = new Set<string>();
     const list: { id: string; name: string; code: string; color: string }[] = [];
-    // Roster first so the picker never shrinks while only some dealers have
-    // loaded; fall back to per-dealer statuses when the roster is absent.
     const source = (data?.roster?.length ? data.roster : (data?.dealers ?? [])).map((d) => ({
       dealerId: d.dealerId,
       dealerName: d.dealerName,
@@ -159,6 +151,8 @@ export default function InventoryReportPage() {
     return urgent;
   }, [aggregates]);
 
+  const podiumItems = React.useMemo(() => watchItems.slice(0, 3), [watchItems]);
+
   const drawerAggregate = React.useMemo(
     () =>
       selection
@@ -180,7 +174,6 @@ export default function InventoryReportPage() {
     return aggregates.filter((a) => (a.productCode || `id:${a.productId}`) === code);
   }, [aggregates, drawerAggregate]);
 
-  // Quiet per-dealer progress: names of dealers still streaming in.
   const pendingDealerNames = React.useMemo(() => {
     const nameById = new Map(dealers.map((d) => [d.id, d.name]));
     return Object.entries(dealerStates)
@@ -188,7 +181,34 @@ export default function InventoryReportPage() {
       .map(([id]) => nameById.get(id) ?? `Dealer ${id}`);
   }, [dealerStates, dealers]);
 
-  if (isLoading && !data) return <InventoryReportSkeleton />;
+  const celebratedRef = React.useRef(false);
+  const networkClear =
+    !!data &&
+    data.success &&
+    (data.rows.length > 0 || (data.stockOuts.length ?? 0) > 0) &&
+    pendingDealerNames.length === 0 &&
+    kpis.outCount === 0 &&
+    kpis.criticalCount + kpis.lowCount === 0;
+  React.useEffect(() => {
+    if (networkClear && !celebratedRef.current) {
+      celebratedRef.current = true;
+      triggerRankConfetti(1);
+    }
+  }, [networkClear]);
+
+  if (isLoading && !data) {
+    return (
+      <div className="relative mx-auto min-h-screen w-full max-w-[1600px] space-y-6 p-2 sm:p-6 md:p-10">
+        <InventoryReportSkeleton />
+        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-background/80 backdrop-blur-sm">
+          <DealeroverEmblemPreloader
+            label="Loading Inventory Report..."
+            sublabel="Streaming dealer stock…"
+          />
+        </div>
+      </div>
+    );
+  }
   if (error) return <ErrorPage message={error} onRefresh={() => void refresh()} />;
   if (data && !data.success) {
     return <ErrorPage message={data.error ?? "Failed to load the inventory report"} onRefresh={() => void refresh()} />;
@@ -224,87 +244,8 @@ export default function InventoryReportPage() {
     .join(" · ");
 
   return (
-    <div className="mx-auto min-h-screen w-full max-w-[1600px] space-y-4 p-2 sm:p-6 md:p-10">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div className="flex min-w-0 items-center gap-3">
-          <div className="shrink-0 rounded-2xl bg-primary/10 p-3 text-primary">
-            <Package className="size-5" />
-          </div>
-          <div className="min-w-0">
-            <h2 className="truncate text-xl font-bold tracking-tight sm:text-2xl">Inventory Report</h2>
-            <p className="truncate text-sm text-muted-foreground">
-              Low-stock signals across every dealer — demand cover, minimums, and value at risk.
-            </p>
-          </div>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="w-44 sm:w-56">
-            <DealerFilterCombobox
-              dealers={dealers}
-              selected={filters.dealerIds}
-              onChange={(ids) => persistFilters({ ...filters, dealerIds: ids })}
-              disabled={isLoading}
-            />
-          </div>
-          {pendingDealerNames.length > 0 && (
-            <span className="max-w-56 truncate text-xs text-muted-foreground" role="status" aria-live="polite" title={pendingDealerNames.join(", ")}>
-              Loading {pendingDealerNames.join(", ")}…
-            </span>
-          )}
-          <div className="grid grid-cols-2 gap-1 rounded-lg bg-muted p-1" role="group" aria-label="Minimum basis">
-            {(["policy", "maintain"] as const).map((basis) => (
-              <Button
-                key={basis}
-                variant={policy.policy.basis === basis ? "default" : "ghost"}
-                size="sm"
-                className={cn("h-7 px-2.5 text-xs", policy.policy.basis !== basis && "text-muted-foreground")}
-                onClick={() => policy.setBasis(basis)}
-                aria-pressed={policy.policy.basis === basis}
-              >
-                {basis === "policy" ? "Policy" : "Maintain"}
-              </Button>
-            ))}
-          </div>
-          <PolicyPanel
-            policy={effectivePolicy}
-            categories={categories}
-            onBasis={policy.setBasis}
-            onLeadDays={policy.setLeadDays}
-            onWindowDays={(days) => persistFilters({ ...filters, windowDays: Math.min(365, Math.max(7, Math.trunc(days) || 30)) })}
-            onDefaultMinCases={policy.setDefaultMinCases}
-            onCategoryMin={policy.setCategoryMin}
-          />
-          <label className="inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-xs text-muted-foreground">
-            <Switch
-              checked={filters.includeZero}
-              onCheckedChange={(checked) => persistFilters({ ...filters, includeZero: checked })}
-              aria-label="Include zero-stock rows"
-            />
-            Zero-stock
-          </label>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void refresh()}
-            disabled={isLoading}
-            className="h-8 gap-2 text-xs"
-            title="Refresh report"
-          >
-            <RefreshCw className={cn("size-4", isLoading && "animate-spin")} />
-            Refresh
-          </Button>
-        </div>
-      </div>
-
-      {offline.length > 0 && (
-        <p className="rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning-foreground" role="status">
-          {offline.length} {offline.length === 1 ? "dealer is" : "dealers are"} offline · {offlineSummary} —
-          showing data from reachable dealers only.
-        </p>
-      )}
-
-      <KpiTiles
+    <div className="mx-auto min-h-screen w-full max-w-[1600px] space-y-6 p-2 sm:p-6 md:p-10">
+      <HeroBand
         dealersOnline={kpis.dealersOnline}
         dealersTotal={kpis.dealersTotal}
         skusTracked={kpis.skusTracked}
@@ -313,6 +254,80 @@ export default function InventoryReportPage() {
         lowCount={kpis.lowCount}
         totalValue={kpis.totalValue}
       />
+
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="w-44 sm:w-56">
+          <DealerFilterCombobox
+            dealers={dealers}
+            selected={filters.dealerIds}
+            onChange={(ids) => persistFilters({ ...filters, dealerIds: ids })}
+            disabled={isLoading}
+          />
+        </div>
+        {pendingDealerNames.length > 0 && (
+          <span className="flex min-w-0 max-w-56 items-center gap-1.5 text-xs text-muted-foreground" role="status" aria-live="polite">
+            <span aria-hidden className="size-2 shrink-0 animate-pulse rounded-full bg-info" />
+            <span className="truncate" title={pendingDealerNames.join(", ")}>
+              Loading {pendingDealerNames.join(", ")}…
+            </span>
+          </span>
+        )}
+        <div className="flex items-center gap-0.5 rounded-lg border border-border p-0.5" role="group" aria-label="Minimum basis">
+          {(["policy", "maintain"] as const).map((basis) => (
+            <Button
+              key={basis}
+              variant={policy.policy.basis === basis ? "default" : "ghost"}
+              size="sm"
+              className={cn("h-7 px-2.5 text-xs min-h-11 md:min-h-0", policy.policy.basis !== basis && "text-muted-foreground")}
+              onClick={() => policy.setBasis(basis)}
+              aria-pressed={policy.policy.basis === basis}
+            >
+              {basis === "policy" ? "Policy" : "Maintain"}
+            </Button>
+          ))}
+        </div>
+        <PolicyPanel
+          policy={effectivePolicy}
+          categories={categories}
+          onBasis={policy.setBasis}
+          onLeadDays={policy.setLeadDays}
+          onWindowDays={(days) => persistFilters({ ...filters, windowDays: Math.min(365, Math.max(7, Math.trunc(days) || 30)) })}
+          onDefaultMinCases={policy.setDefaultMinCases}
+          onCategoryMin={policy.setCategoryMin}
+        />
+        <label className="inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-xs text-muted-foreground">
+          <Switch
+            checked={filters.includeZero}
+            onCheckedChange={(checked) => persistFilters({ ...filters, includeZero: checked })}
+            aria-label="Include zero-stock rows"
+          />
+          Zero-stock
+        </label>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => void refresh()}
+          disabled={isLoading}
+          className="h-8 gap-2 text-xs min-h-11 md:min-h-0"
+          title="Refresh report"
+        >
+          <RefreshCw className={cn("size-4", isLoading && "animate-spin")} />
+          Refresh
+        </Button>
+      </div>
+
+      {offline.length > 0 && (
+        <p className="flex flex-wrap items-center gap-2 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-foreground" role="status">
+          <StatusBadge tone="warning">
+            {offline.length} {offline.length === 1 ? "dealer" : "dealers"} offline
+          </StatusBadge>
+          <span>
+            {offlineSummary} — showing data from reachable dealers only.
+          </span>
+        </p>
+      )}
+
+      <UrgencyPodium items={podiumItems} onSelect={handleSelect} />
 
       <LowStockBoard aggregates={aggregates} dealers={data?.dealers ?? []} onSelect={handleSelect} />
 
@@ -336,3 +351,5 @@ export default function InventoryReportPage() {
     </div>
   );
 }
+
+export { InventoryReportSkeleton };

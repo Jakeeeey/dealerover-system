@@ -4,22 +4,14 @@ import * as React from "react";
 import { GitCompareArrows } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { StatusBadge, type StatusTone } from "@/components/ui/status-badge";
+import { StatusBadge } from "@/components/ui/status-badge";
+import { cn } from "@/lib/utils";
 import { formatCurrency, formatDateTime, formatNumber } from "@/lib/utils";
-import type { InventoryRow, LowStockState } from "../types";
+import type { InventoryRow } from "../types";
 import { computeSeverity, daysOfCover, inventoryValue } from "../utils/low-stock";
 import type { ProductAggregate } from "../utils/aggregate";
+import { STATE_LABEL, STRIP_BG, TONE_BY_STATE } from "../utils/severity-tone";
 import { ThresholdCell } from "./ThresholdCell";
-
-const TONE_BY_STATE: Record<LowStockState, StatusTone> = {
-  out: "destructive",
-  critical: "destructive",
-  low: "warning",
-  watch: "info",
-  healthy: "success",
-  overstock: "neutral",
-  dead: "neutral",
-};
 
 export interface ItemDrawerSelection {
   dealerId: string;
@@ -61,7 +53,6 @@ function formatCutoff(value: string): string {
   return formatDateTime(d);
 }
 
-/** Item drawer: detail, per-branch table, threshold editor, network compare. */
 export function ItemDrawer({
   selection,
   aggregate,
@@ -104,22 +95,73 @@ export function ItemDrawer({
     [branchRows, leadDays, windowDays],
   );
 
+  const meter = React.useMemo(() => {
+    if (!aggregate) return null;
+    if (aggregate.effectiveMin > 0) {
+      return {
+        pct: Math.min(100, Math.max(0, (aggregate.onHand / aggregate.effectiveMin) * 100)),
+        caption: `${displayUnitsText(aggregate.onHand, aggregate.unitCount, aggregate.unitName)} on hand vs ${displayUnitsText(aggregate.effectiveMin, aggregate.unitCount, aggregate.unitName)} minimum`,
+      };
+    }
+    if (aggregate.daysOfCover !== null && leadDays > 0) {
+      const rounded = Math.round(aggregate.daysOfCover * 10) / 10;
+      return {
+        pct: Math.min(100, Math.max(0, (aggregate.daysOfCover / leadDays) * 100)),
+        caption: `${Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)} days of cover vs ${leadDays}-day lead time`,
+      };
+    }
+    return null;
+  }, [aggregate, leadDays]);
+
+  const ruleLine = React.useMemo(() => {
+    if (!aggregate) return "";
+    const parts = [`${aggregate.reason}`];
+    if (aggregate.daysOfCover !== null) {
+      const rounded = Math.round(aggregate.daysOfCover * 10) / 10;
+      parts.push(`cover ${Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)}d vs ${leadDays}d lead`);
+    }
+    if (aggregate.effectiveMin > 0) {
+      parts.push(`minimum ${displayUnitsText(aggregate.effectiveMin, aggregate.unitCount, aggregate.unitName)}`);
+    }
+    if (aggregate.demandQty > 0) {
+      parts.push(`demand ${formatNumber(aggregate.demandQty, "en-PH", 0)} pcs / ${windowDays}d`);
+    }
+    return parts.join(" · ");
+  }, [aggregate, leadDays, windowDays]);
+
   return (
     <Sheet open={open} onOpenChange={(next) => { if (!next) onClose(); }}>
       <SheetContent side="right" className="w-full overflow-y-auto sm:max-w-md">
         {aggregate && (
           <>
             <SheetHeader className="text-left">
-              <SheetTitle className="pr-8 text-base leading-tight">{aggregate.productName}</SheetTitle>
-              <SheetDescription className="text-xs">
-                {aggregate.productCode} · {aggregate.dealerName}
+              <SheetTitle className="pr-8 text-lg font-bold leading-tight">{aggregate.productName}</SheetTitle>
+              <SheetDescription className="font-mono text-[10px] uppercase">
+                {aggregate.productCode || `id:${aggregate.productId}`}
+                {firstRow?.productBarcode ? ` · ${firstRow.productBarcode}` : ""} · {aggregate.dealerName}
               </SheetDescription>
             </SheetHeader>
 
             <div className="flex flex-wrap items-center gap-2 px-4">
-              <StatusBadge tone={TONE_BY_STATE[aggregate.state]}>{aggregate.state}</StatusBadge>
-              <span className="text-xs text-muted-foreground">{aggregate.reason}</span>
+              <StatusBadge tone={TONE_BY_STATE[aggregate.state]} className="text-xs">
+                {STATE_LABEL[aggregate.state]}
+              </StatusBadge>
+              <span className="text-base font-black tabular-nums tracking-tight">{formatCurrency(aggregate.value)}</span>
+              <span className="text-[11px] text-muted-foreground">at risk</span>
             </div>
+
+            <p className="px-4 text-xs text-muted-foreground">
+              Fired rule ({aggregate.reasonSource}): {ruleLine}
+            </p>
+
+            {meter && (
+              <div className="space-y-1 px-4" role="img" aria-label={`Stock level: ${meter.caption}`}>
+                <div className="h-2 overflow-hidden rounded-full bg-muted">
+                  <div className={cn("h-full rounded-full", STRIP_BG[aggregate.state])} style={{ width: `${meter.pct}%` }} />
+                </div>
+                <p className="text-[11px] tabular-nums text-muted-foreground">{meter.caption}</p>
+              </div>
+            )}
 
             <dl className="grid grid-cols-2 gap-x-4 gap-y-2 px-4 text-xs">
               <div><dt className="text-muted-foreground">Barcode</dt><dd className="truncate font-medium tabular-nums">{firstRow?.productBarcode || "—"}</dd></div>
@@ -167,7 +209,12 @@ export function ItemDrawer({
                   <tbody>
                     {branchView.map(({ row, doc, severity }) => (
                       <tr key={row.key} className="border-t">
-                        <td className="max-w-28 truncate px-2 py-1.5 font-medium" title={row.branchName}>{row.branchName}</td>
+                        <td className="max-w-28 px-2 py-1.5 font-medium" title={row.branchName}>
+                          <span className="flex items-center gap-1.5">
+                            <span aria-hidden className={cn("size-2 shrink-0 rounded-full", STRIP_BG[severity.state])} />
+                            <span className="truncate">{row.branchName}</span>
+                          </span>
+                        </td>
                         <td className="px-2 py-1.5 text-right tabular-nums">
                           {formatNumber(row.onHand, "en-PH", 0)}
                           <span className="block text-[10px] text-muted-foreground">
@@ -177,7 +224,7 @@ export function ItemDrawer({
                         <td className="px-2 py-1.5 text-right tabular-nums">{formatNumber(row.movementAfter, "en-PH", 0)}</td>
                         <td className="px-2 py-1.5 text-right tabular-nums">{doc === null ? "—" : `${Math.round(doc * 10) / 10}d`}</td>
                         <td className="px-2 py-1.5">
-                          <StatusBadge tone={TONE_BY_STATE[severity.state]}>{severity.state}</StatusBadge>
+                          <StatusBadge tone={TONE_BY_STATE[severity.state]}>{STATE_LABEL[severity.state]}</StatusBadge>
                         </td>
                         <td className="px-2 py-1.5 text-right tabular-nums">
                           {formatCurrency(inventoryValue(row.onHand, row.unitCount, row.costPerUnit))}
@@ -229,7 +276,7 @@ export function ItemDrawer({
                           </td>
                           <td className="px-2 py-1.5 text-right tabular-nums">{formatNumber(peer.onHand, "en-PH", 0)}</td>
                           <td className="px-2 py-1.5">
-                            <StatusBadge tone={TONE_BY_STATE[peer.state]}>{peer.state}</StatusBadge>
+                            <StatusBadge tone={TONE_BY_STATE[peer.state]}>{STATE_LABEL[peer.state]}</StatusBadge>
                           </td>
                           <td className="px-2 py-1.5 text-right tabular-nums">{formatCurrency(peer.value)}</td>
                         </tr>
