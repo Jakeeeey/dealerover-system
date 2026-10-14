@@ -3,7 +3,6 @@
 import * as React from "react";
 import { ArrowLeft, Loader2, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Switch } from "@/components/ui/switch";
 import { TonePill } from "./components/StatusPill";
 import { cn, formatNumber } from "@/lib/utils";
 import { ErrorPage } from "@/app/(dealerover-system)/dealerover-system/_components/ErrorPage";
@@ -26,11 +25,10 @@ const FILTER_STORAGE_KEY = "dealerover-hq.inventory-report.filters";
 
 interface FilterState {
   dealerId: string;
-  includeZero: boolean;
   windowDays: number;
 }
 
-const DEFAULT_FILTERS: FilterState = { dealerId: "", includeZero: false, windowDays: 30 };
+const DEFAULT_FILTERS: FilterState = { dealerId: "", windowDays: 30 };
 
 const DIMENSION_WORD: Record<"brand" | "category" | "supplier", string> = {
   brand: "Brand",
@@ -54,12 +52,11 @@ function readStoredFilters(): FilterState {
     if (!raw) return DEFAULT_FILTERS;
     const parsed = JSON.parse(raw) as Partial<FilterState>;
     const dealerId = typeof parsed.dealerId === "string" ? parsed.dealerId : "";
-    const includeZero = parsed.includeZero === true;
     const windowDays =
       typeof parsed.windowDays === "number" && Number.isFinite(parsed.windowDays)
         ? Math.min(365, Math.max(7, Math.trunc(parsed.windowDays)))
         : 30;
-    return { dealerId, includeZero, windowDays };
+    return { dealerId, windowDays };
   } catch {
     return DEFAULT_FILTERS;
   }
@@ -94,11 +91,13 @@ export default function InventoryReportPage() {
   const query = React.useMemo(
     () => ({
       dealerId: filters.dealerId || null,
-      includeZero: filters.includeZero,
+      // The classifier covers the whole master catalogue, so zero-stock rows are
+      // never needed from the backend: always false keeps every page small.
+      includeZero: false,
       windowDays: filters.windowDays,
       lookbackDays: policy.policy.lookbackDays,
     }),
-    [filters.dealerId, filters.includeZero, filters.windowDays, policy.policy.lookbackDays],
+    [filters.dealerId, filters.windowDays, policy.policy.lookbackDays],
   );
   const {
     roster,
@@ -201,7 +200,14 @@ export default function InventoryReportPage() {
     () => aggregates.filter((a) => FLAGGED_STATES.has(a.state)).length,
     [aggregates],
   );
-  const totalValue = React.useMemo(() => aggregates.reduce((sum, a) => sum + a.value, 0), [aggregates]);
+  const wellStocked = React.useMemo(
+    () => aggregates.filter((a) => a.state === "healthy").length,
+    [aggregates],
+  );
+  const notSelling = React.useMemo(
+    () => aggregates.filter((a) => a.state === "dropped" || a.state === "unrated").length,
+    [aggregates],
+  );
 
   const drillView = React.useMemo(() => {
     if (!drill) return null;
@@ -299,9 +305,11 @@ export default function InventoryReportPage() {
 
   if (isLoading && (rows?.length ?? 0) === 0 && !dealer) {
     return (
-      <div className="relative mx-auto min-h-screen w-full max-w-[1600px] space-y-6 p-2 sm:p-6 md:p-10">
-        <InventoryReportSkeleton />
-        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-background/80 backdrop-blur-sm">
+      <div className="relative mx-auto h-[100dvh] w-full max-w-[1600px] overflow-hidden p-2 sm:p-6 md:p-10">
+        <div aria-hidden className="pointer-events-none opacity-40">
+          <InventoryReportSkeleton />
+        </div>
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
           <DealeroverEmblemPreloader
             label="Loading Inventory Report..."
             sublabel="Streaming dealer stock…"
@@ -324,55 +332,44 @@ export default function InventoryReportPage() {
         dealerName={dealer?.dealerName ?? ""}
         dealerCode={dealer?.dealerCode ?? ""}
         online={!offline}
-        totalValue={totalValue}
+        wellStocked={wellStocked}
+        needsAttention={flaggedCount}
+        notSelling={notSelling}
       />
 
-      {/* Toolbar — scope | analytics | action: every control keeps its own
-          group when the row wraps. Anything that is a STATUS (streaming,
-          offline) lives in its own strip below, so a state never gets
-          mistaken for a control. */}
+      {/* Toolbar — scope on the left, the demand-analytics controls and the
+          action together on the right. Anything that is a STATUS (streaming,
+          offline) lives in its own strip below, so a state never gets mistaken
+          for a control. */}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="w-44 sm:w-56">
-            <DealerSelect
-              dealers={roster ?? []}
-              value={activeDealerId}
-              onChange={(id) => persistFilters({ ...filters, dealerId: id })}
-              disabled={isLoading}
-            />
-          </div>
-          <label className="inline-flex h-8 min-h-11 items-center gap-1.5 rounded-md border px-2.5 text-xs text-muted-foreground md:min-h-0">
-            <Switch
-              checked={filters.includeZero}
-              onCheckedChange={(checked) => persistFilters({ ...filters, includeZero: checked })}
-              aria-label="Include zero-stock rows"
-            />
-            Zero-stock
-          </label>
+        <div className="w-44 sm:w-56">
+          <DealerSelect
+            dealers={roster ?? []}
+            value={activeDealerId}
+            onChange={(id) => persistFilters({ ...filters, dealerId: id })}
+            disabled={isLoading}
+          />
         </div>
 
-        <span className="h-5 w-px shrink-0 bg-border" aria-hidden />
-
-        <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Demand analytics">
+        <div className="ml-auto flex flex-wrap items-center gap-2" role="group" aria-label="Report controls">
           <PolicyPanel
             policy={effectivePolicy}
             onLeadDays={policy.setLeadDays}
             onWindowDays={(days) => persistFilters({ ...filters, windowDays: Math.min(365, Math.max(7, Math.trunc(days) || 30)) })}
             onLookbackDays={policy.setLookbackDays}
           />
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => refresh({ bypassCache: true })}
+            disabled={isLoading}
+            className="h-8 gap-2 text-xs min-h-11 md:min-h-0"
+            title="Refresh report"
+          >
+            <RefreshCw className={cn("size-4", isLoading && "animate-spin")} />
+            Refresh
+          </Button>
         </div>
-
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => refresh({ bypassCache: true })}
-          disabled={isLoading}
-          className="ml-auto h-8 gap-2 text-xs min-h-11 md:min-h-0"
-          title="Refresh report"
-        >
-          <RefreshCw className={cn("size-4", isLoading && "animate-spin")} />
-          Refresh
-        </Button>
       </div>
 
       {streaming && (
@@ -463,6 +460,7 @@ export default function InventoryReportPage() {
             dealers={dealer ? [dealer] : []}
             onSelect={handleSelect}
             emptyHint={drillView.emptyHint}
+            allowGrid={drill.kind !== "severity"}
           />
         </section>
       ) : (
@@ -481,6 +479,7 @@ export default function InventoryReportPage() {
             scanned: progress?.scanned ?? 0,
             plotted: progress?.plotted ?? 0,
           }}
+          lastInvoiceAt={lastInvoiceAt}
           onDrill={setDrill}
           onSelectItem={handleSelect}
         />

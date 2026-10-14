@@ -4,7 +4,10 @@ import type * as React from "react";
 import type { StatusTone } from "@/components/ui/status-badge";
 import { cn } from "@/lib/utils";
 import type { LowStockState } from "../types";
-import { STATE_LABEL, TONE_BY_STATE, TONE_PILL } from "../utils/severity-tone";
+import { PILL_OVERRIDE, STATE_LABEL, TONE_BY_STATE, TONE_PILL } from "../utils/severity-tone";
+
+const PILL_BASE =
+  "inline-flex w-fit shrink-0 items-center justify-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5 text-xs font-medium";
 
 /**
  * Module-local status pill.
@@ -24,20 +27,13 @@ export function TonePill({
   children: React.ReactNode;
   className?: string;
 }) {
-  return (
-    <span
-      className={cn(
-        "inline-flex w-fit shrink-0 items-center justify-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5 text-xs font-medium",
-        TONE_PILL[tone],
-        className,
-      )}
-    >
-      {children}
-    </span>
-  );
+  return <span className={cn(PILL_BASE, TONE_PILL[tone], className)}>{children}</span>;
 }
 
-/** A severity state rendered as a tone-correct pill. */
+/**
+ * A severity state rendered as a tone-correct pill, honouring the per-state
+ * overrides that keep the grey family distinguishable.
+ */
 export function SeverityPill({
   state,
   className,
@@ -46,8 +42,8 @@ export function SeverityPill({
   className?: string;
 }) {
   return (
-    <TonePill tone={TONE_BY_STATE[state]} className={className}>
+    <span className={cn(PILL_BASE, PILL_OVERRIDE[state] ?? TONE_PILL[TONE_BY_STATE[state]], className)}>
       {STATE_LABEL[state]}
-    </TonePill>
+    </span>
   );
 }

@@ -57,6 +57,46 @@ export interface InventoryReportResult {
 
 const EMPTY_PROGRESS: InventoryProgress = { pagesDone: 0, totalPages: 0, scanned: 0, plotted: 0 };
 
+/**
+ * Client-side retention for a fully loaded dealer. Without it, navigating away
+ * and back re-mounted this page and replayed meta + every branch page, which is
+ * what made a 30-second absence feel like a cold load. Server caches (3–5 min)
+ * absorbed the cost, but the round trips and the loading screen still happened.
+ */
+const CLIENT_CACHE_TTL_MS = 5 * 60 * 1000;
+
+interface CachedDealerLoad {
+  dealer: DealerStatus | null;
+  branches: DealerBranch[];
+  products: MasterProduct[];
+  analytics: ProductDemand[];
+  analyticsAvailable: boolean;
+  lastInvoiceAt: string;
+  rows: InventoryRow[];
+  scanned: number;
+  pagesDone: number;
+  totalPages: number;
+  generatedAt: string;
+  expiry: number;
+}
+
+const EMPTY_CACHED: Omit<CachedDealerLoad, "expiry"> = {
+  dealer: null,
+  branches: [],
+  products: [],
+  analytics: [],
+  analyticsAvailable: false,
+  lastInvoiceAt: "",
+  rows: [],
+  scanned: 0,
+  pagesDone: 0,
+  totalPages: 0,
+  generatedAt: "",
+};
+
+/** Keyed by dealer + demand parameters, so switching back is instant too. */
+const CLIENT_CACHE = new Map<string, CachedDealerLoad>();
+
 function isAbort(err: unknown): boolean {
   return err instanceof DOMException && err.name === "AbortError";
 }
@@ -137,6 +177,41 @@ export function useInventoryReport(query: InventoryReportQuery): InventoryReport
     generationRef.current = generation;
     const controller = new AbortController();
 
+    const cacheKey = `${dealerId}|${windowDays}|${lookbackDays}|${includeZero ? 1 : 0}`;
+    const storeCache = (partial: Partial<CachedDealerLoad>): void => {
+      CLIENT_CACHE.set(cacheKey, {
+        ...(CLIENT_CACHE.get(cacheKey) ?? EMPTY_CACHED),
+        ...partial,
+        expiry: Date.now() + CLIENT_CACHE_TTL_MS,
+      });
+    };
+
+    // A freshly cached dealer renders straight from memory: no loading screen
+    // and no requests. Refresh (bypassCache) and expiry take the network path.
+    if (!wave.bypassCache) {
+      const hit = CLIENT_CACHE.get(cacheKey);
+      if (hit && hit.expiry > Date.now()) {
+        setDealer(hit.dealer);
+        setBranches(hit.branches);
+        setProducts(hit.products);
+        setAnalytics(hit.analytics);
+        setAnalyticsAvailable(hit.analyticsAvailable);
+        setLastInvoiceAt(hit.lastInvoiceAt);
+        setRows(hit.rows);
+        setProgress({
+          pagesDone: hit.pagesDone,
+          totalPages: hit.totalPages,
+          scanned: hit.scanned,
+          plotted: hit.rows.length,
+        });
+        setGeneratedAt(hit.generatedAt);
+        setError(null);
+        setMetaLoading(false);
+        setStreaming(false);
+        return;
+      }
+    }
+
     // Dealer/filter change: reset rows, then load meta, then stream pages.
     setRows([]);
     setProgress(EMPTY_PROGRESS);
@@ -160,8 +235,16 @@ export function useInventoryReport(query: InventoryReportQuery): InventoryReport
       signal: controller.signal,
     }).then(
       (analyticsRes) => {
+        const products = analyticsRes.success ? analyticsRes.products : [];
+        // Cached even if a newer wave has taken over: the key belongs to this
+        // wave's parameters, so the entry stays correct.
+        storeCache({
+          analytics: products,
+          analyticsAvailable: analyticsRes.success,
+          lastInvoiceAt: analyticsRes.lastInvoiceAt ?? "",
+        });
         if (generation !== generationRef.current) return;
-        setAnalytics(analyticsRes.success ? analyticsRes.products : []);
+        setAnalytics(products);
         setAnalyticsAvailable(analyticsRes.success);
         setLastInvoiceAt(analyticsRes.lastInvoiceAt ?? "");
       },
@@ -171,8 +254,10 @@ export function useInventoryReport(query: InventoryReportQuery): InventoryReport
           `ERR_ANALYTICS_FAIL: [InventoryReport] Demand index failed for dealer "${dealerId}":`,
           err,
         );
+        storeCache({ analytics: [], analyticsAvailable: false, lastInvoiceAt: "" });
         if (generation !== generationRef.current) return;
         setAnalytics([]);
+        setAnalyticsAvailable(false);
         setLastInvoiceAt("");
       },
     );
@@ -212,6 +297,7 @@ export function useInventoryReport(query: InventoryReportQuery): InventoryReport
       setStreaming(true);
       const merged: InventoryRow[] = [];
       let scanned = 0;
+      let complete = true;
       for (let page = 0; page < totalPages; page += 1) {
         let res;
         try {
@@ -225,12 +311,14 @@ export function useInventoryReport(query: InventoryReportQuery): InventoryReport
           if (generation !== generationRef.current) return;
           if (isAbort(err)) return;
           setError(messageOf(err, "Failed to load inventory page"));
+          complete = false;
           break;
         }
         // An older wave's page must never merge into the current dealer.
         if (generation !== generationRef.current) return;
         if (!res.success) {
           setError(res.error ?? "Failed to load inventory page");
+          complete = false;
           break;
         }
         merged.push(...res.rows);
@@ -242,6 +330,21 @@ export function useInventoryReport(query: InventoryReportQuery): InventoryReport
       }
       if (generation !== generationRef.current) return;
       setStreaming(false);
+
+      // Only a complete load is worth remembering: a partial one would look
+      // like the whole truth on the next visit.
+      if (complete) {
+        storeCache({
+          dealer: meta.dealer,
+          branches: meta.branches,
+          products: meta.products,
+          rows: merged,
+          scanned,
+          pagesDone: totalPages,
+          totalPages,
+          generatedAt: new Date().toISOString(),
+        });
+      }
     }
 
     void run();

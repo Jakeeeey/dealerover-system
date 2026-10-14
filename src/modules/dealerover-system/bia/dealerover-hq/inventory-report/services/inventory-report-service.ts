@@ -344,7 +344,20 @@ async function loginToDealerSpringBoot(springbootUrl: string): Promise<LoginOutc
  * requests for one dealer share a single login instead of logging in ten
  * times.
  */
-const SPRING_TOKEN_CACHE = new Map<string, { token: string; expiry: number }>();
+// Pinned to `global` so a dev-server HMR recompile cannot silently drop warm
+// caches. The shared dealeroverCache already survives HMR; these two did not,
+// which quietly cost a roster fetch and a Spring re-login after every edit.
+const globalForInventoryCaches = global as unknown as {
+  inventorySpringTokenCache?: Map<string, { token: string; expiry: number }>;
+  inventoryDealerListCache?: { data: DealerRow[] | null; expiry: number };
+};
+
+const SPRING_TOKEN_CACHE =
+  globalForInventoryCaches.inventorySpringTokenCache ??
+  new Map<string, { token: string; expiry: number }>();
+if (process.env.NODE_ENV !== "production") {
+  globalForInventoryCaches.inventorySpringTokenCache = SPRING_TOKEN_CACHE;
+}
 
 function clearSpringToken(springBase: string): void {
   SPRING_TOKEN_CACHE.delete(springBase);
@@ -366,7 +379,11 @@ async function getSpringToken(springBase: string, forceRefresh = false): Promise
   return login;
 }
 
-const DEALER_LIST_CACHE: { data: DealerRow[] | null; expiry: number } = { data: null, expiry: 0 };
+const DEALER_LIST_CACHE: { data: DealerRow[] | null; expiry: number } =
+  globalForInventoryCaches.inventoryDealerListCache ?? { data: null, expiry: 0 };
+if (process.env.NODE_ENV !== "production") {
+  globalForInventoryCaches.inventoryDealerListCache = DEALER_LIST_CACHE;
+}
 
 async function getCachedDealerList(): Promise<DealerRow[]> {
   const now = Date.now();

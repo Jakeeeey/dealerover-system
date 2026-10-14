@@ -19,6 +19,12 @@ interface LowStockBoardProps {
   onSelect: (dealerId: string, productId: number) => void;
   title?: string;
   emptyHint?: string;
+  /**
+   * Matrix view is only offered where states vary across rows (brand, category,
+   * supplier, branch, ranked). A status-filtered list gives every row the same
+   * state, so it is table-only.
+   */
+  allowGrid?: boolean;
 }
 
 const LIST_PAGE_SIZE = 10;
@@ -66,8 +72,16 @@ function davMavLabel(item: ProductAggregate): string {
   return `${formatCompact(dav)}/d · ${formatCompact(dav * 30)}/mo`;
 }
 
-export function LowStockBoard({ aggregates, dealers, onSelect, title, emptyHint }: LowStockBoardProps) {
-  const [view, setView] = React.useState<"grid" | "list">("grid");
+export function LowStockBoard({
+  aggregates,
+  dealers,
+  onSelect,
+  title,
+  emptyHint,
+  allowGrid = true,
+}: LowStockBoardProps) {
+  const [view, setView] = React.useState<"grid" | "list">(allowGrid ? "grid" : "list");
+  const effectiveView: "grid" | "list" = allowGrid ? view : "list";
   const [query, setQuery] = React.useState("");
   const [sortByValue, setSortByValue] = React.useState(false);
   const [page, setPage] = React.useState(1);
@@ -115,8 +129,8 @@ export function LowStockBoard({ aggregates, dealers, onSelect, title, emptyHint 
     return map;
   }, [aggregates]);
 
-  const pageSize = view === "grid" ? GRID_PAGE_SIZE : LIST_PAGE_SIZE;
-  const viewTotal = view === "grid" ? productCodes.length : filtered.length;
+  const pageSize = effectiveView === "grid" ? GRID_PAGE_SIZE : LIST_PAGE_SIZE;
+  const viewTotal = effectiveView === "grid" ? productCodes.length : filtered.length;
   const totalPages = Math.max(1, Math.ceil(viewTotal / pageSize));
   const safePage = Math.min(Math.max(1, page), totalPages);
   const pageRows = React.useMemo(
@@ -142,7 +156,7 @@ export function LowStockBoard({ aggregates, dealers, onSelect, title, emptyHint 
     <section aria-label={title ?? "Low-stock board"} className="space-y-2">
       {title && <h3 className="text-sm font-semibold">{title}</h3>}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex items-center gap-0.5 self-start rounded-lg border border-border p-0.5" role="group" aria-label="Board view">
+        <div className={cn("flex items-center gap-0.5 self-start rounded-lg border border-border p-0.5", !allowGrid && "hidden")} role="group" aria-label="Board view">
           <Button
             variant={view === "grid" ? "default" : "ghost"}
             size="sm"
@@ -225,7 +239,7 @@ export function LowStockBoard({ aggregates, dealers, onSelect, title, emptyHint 
             {emptyHint ?? "Clear the search or pick a different dealer set to see low-stock signals."}
           </p>
         </div>
-      ) : view === "grid" ? (
+      ) : effectiveView === "grid" ? (
         <div className="space-y-2">
           <div className="overflow-x-auto rounded-xl border">
             <table className="w-full min-w-[640px] border-collapse text-xs">

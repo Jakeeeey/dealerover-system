@@ -110,7 +110,7 @@ function resolveDealer(
  * rows get onHand 0 with pack size / cost from the master and demand
  * from the analytics index — which is what tells a true stock-out (live
  * demand, nothing on hand) apart from a dropped product (no sales in the
- * lookback, no stock) and dead stock (no sales in the lookback, still
+ * lookback, no stock) and non-moving stock (no sales in the lookback, still
  * holding units).
  */
 export function buildProductAggregates(

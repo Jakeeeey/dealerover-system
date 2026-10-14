@@ -89,7 +89,7 @@ export function PolicyPanel({ policy, onLeadDays, onWindowDays, onLookbackDays }
                 className="h-8 text-xs tabular-nums"
               />
               <p className="text-[11px] leading-snug text-muted-foreground">
-                No sale in this long means dead stock — or dropped, when nothing is on hand.
+                No sale in this long means non-moving stock — or dropped, when nothing is on hand.
               </p>
             </div>
           </div>

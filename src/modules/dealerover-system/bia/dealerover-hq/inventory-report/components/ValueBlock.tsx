@@ -223,7 +223,7 @@ export function ValueBlock({
       <div
         role="img"
         aria-label={summary}
-        className="mt-3 flex flex-col gap-1.5 rounded-2xl border bg-card p-2 sm:flex-row sm:flex-wrap"
+        className="mt-3 flex flex-col gap-1.5 rounded-2xl border border-border/70 bg-muted/40 p-2 shadow-sm sm:flex-row sm:flex-wrap"
       >
         {cells.map((cell, index) => {
           const share = totalSize > 0 ? sizeOf(cell) / totalSize : 0;
@@ -243,7 +243,7 @@ export function ValueBlock({
               aria-label={`${cell.label}, ${STATE_LABEL[cell.worst]}, ${formatCurrency(figure)} in ${formatNumber(count, "en-PH", 0)} ${countNoun} — view table`}
               title={`${cell.label} · ${formatCurrency(figure)} · ${formatNumber(count, "en-PH", 0)} ${countNoun}`}
               className={cn(
-                "min-w-0 rounded-lg px-3 py-2 text-left transition-[background-color,border-color,opacity] duration-200 hover:opacity-90 focus-visible:outline-2 focus-visible:outline-ring",
+                "min-w-0 rounded-lg px-3 py-2 text-left transition-[transform,background-color,box-shadow] duration-200 hover:-translate-y-px hover:shadow-md focus-visible:outline-2 focus-visible:outline-ring",
                 CELL_WASH[cell.worst],
                 index >= 3 && !isRemainder && "hidden sm:block",
               )}
