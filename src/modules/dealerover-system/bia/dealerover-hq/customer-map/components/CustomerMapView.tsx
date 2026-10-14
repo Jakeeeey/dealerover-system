@@ -236,6 +236,46 @@ function buildMappableData(
   } as MappableData;
 }
 
+type LngLatBounds = [[number, number], [number, number]];
+
+/** Bounding box of a boundary FeatureCollection's coordinates, or null. */
+function boundsOfHighlight(highlight: BoundaryHighlight | null | undefined): LngLatBounds | null {
+  if (!highlight || !Array.isArray(highlight.features) || highlight.features.length === 0) {
+    return null;
+  }
+  let minLng = Infinity;
+  let minLat = Infinity;
+  let maxLng = -Infinity;
+  let maxLat = -Infinity;
+  const visit = (coords: unknown): void => {
+    if (!Array.isArray(coords)) return;
+    if (typeof coords[0] === "number" && typeof coords[1] === "number") {
+      const lng = coords[0] as number;
+      const lat = coords[1] as number;
+      if (Number.isFinite(lng) && Number.isFinite(lat)) {
+        if (lng < minLng) minLng = lng;
+        if (lng > maxLng) maxLng = lng;
+        if (lat < minLat) minLat = lat;
+        if (lat > maxLat) maxLat = lat;
+      }
+      return;
+    }
+    for (const child of coords) visit(child);
+  };
+  for (const feature of highlight.features) {
+    visit(feature.geometry?.coordinates);
+  }
+  return Number.isFinite(minLng) &&
+    Number.isFinite(minLat) &&
+    Number.isFinite(maxLng) &&
+    Number.isFinite(maxLat)
+    ? [
+        [minLng, minLat],
+        [maxLng, maxLat],
+      ]
+    : null;
+}
+
 function DetailRow({ label, value }: { label: string; value: string }) {
   if (!value) return null;
   return (
@@ -567,17 +607,17 @@ function applyBoundaryLayers(map: MapLibreMap, highlight: BoundaryHighlight | nu
     });
   }
 
-  // Enforce bottom-to-top stacking: dim + tint + heat wash the base map, then the
-  // border (glow + line + core), then the customer points ON TOP of everything so
-  // no border ever covers a dot.
+  // Enforce bottom-to-top stacking: dim + tint wash the base map, then the border
+  // (glow + line + core), then heat + customer points ON TOP so the border never
+  // covers a data layer.
   for (const id of [
     DIM_ID,
     TINT_ID,
-    HEAT_ID,
     GLOW_FAR_ID,
     GLOW_NEAR_ID,
     LINE_ID,
     CORE_ID,
+    HEAT_ID,
     CIRCLE_ID,
     CLUSTER_CIRCLE_ID,
     CLUSTER_COUNT_ID,
@@ -1025,7 +1065,11 @@ export function CustomerMapView({
         ? previous
         : { kind: "list", customers: remaining };
     });
-    if (customers.length > 0) {
+    // Prefer the selected boundary's extent (a Location filter) so the whole
+    // province / city / barangay is framed; fall back to the customers' extent
+    // for attribute-only filters.
+    let bounds = boundsOfHighlight(boundaryHighlight);
+    if (!bounds && customers.length > 0) {
       let minLng = Infinity;
       let minLat = Infinity;
       let maxLng = -Infinity;
@@ -1036,24 +1080,24 @@ export function CustomerMapView({
         minLat = Math.min(minLat, customer.lat);
         maxLat = Math.max(maxLat, customer.lat);
       }
-      // Fit the filtered set. The zoom ceiling is high so small cities / barangays
-      // still fill the view (vector tiles overzoom crisply); the left padding
-      // keeps the region clear of the floating sidebar on desktop.
+      bounds = [
+        [minLng, minLat],
+        [maxLng, maxLat],
+      ];
+    }
+    if (bounds) {
+      // The zoom ceiling is high so small cities / barangays still fill the view
+      // (vector tiles overzoom crisply); the left padding keeps the region clear
+      // of the floating sidebar on desktop.
       const sidebarInset =
         typeof window !== "undefined" && window.innerWidth >= 1024 ? 336 : 0;
-      map.fitBounds(
-        [
-          [minLng, minLat],
-          [maxLng, maxLat],
-        ],
-        {
-          padding: { top: 72, bottom: 72, left: 56 + sidebarInset, right: 56 },
-          maxZoom: 18,
-          duration: 600,
-        },
-      );
+      map.fitBounds(bounds, {
+        padding: { top: 72, bottom: 72, left: 56 + sidebarInset, right: 56 },
+        maxZoom: 18,
+        duration: 600,
+      });
     }
-  }, [customers, mapReady]);
+  }, [customers, boundaryHighlight, mapReady]);
 
   // Full-bleed stage: the map is the base layer (z-0) and every strip is a
   // floating glass overlay — offline pill top-center (z-10), legend pill

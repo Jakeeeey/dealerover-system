@@ -27,13 +27,16 @@ export async function GET(req: NextRequest) {
   const levelParam = params.get("level");
   const name = (params.get("name") ?? "").trim();
   const city = (params.get("city") ?? "").trim();
+  const province = (params.get("province") ?? "").trim();
 
   if (!isLevel(levelParam) || !name) {
     return NextResponse.json({ type: "FeatureCollection", features: [] });
   }
 
   try {
-    return NextResponse.json(getBoundary(levelParam, name, city || undefined));
+    return NextResponse.json(
+      getBoundary(levelParam, name, city || undefined, province || undefined),
+    );
   } catch (error) {
     console.error("[CustomerMap-Boundary-API] Failed to serve boundary:", error);
     return NextResponse.json({ type: "FeatureCollection", features: [] });

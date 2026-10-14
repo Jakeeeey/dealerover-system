@@ -246,12 +246,22 @@ export default function CustomerMapPage() {
   }, [dealers, filteredCustomers]);
 
   // Deepest geo filter wins the highlight; the barangay name travels with its
-  // parent city so duplicate barangay names resolve to the right polygon.
+  // parent city + province so duplicate barangay names resolve to the right polygon.
   const boundarySelection = React.useMemo<BoundarySelection | null>(() => {
     if (filters.brgy && filters.city) {
-      return { level: "barangay", name: filters.brgy, city: filters.city };
+      const selection: BoundarySelection = {
+        level: "barangay",
+        name: filters.brgy,
+        city: filters.city,
+      };
+      if (filters.province) selection.province = filters.province;
+      return selection;
     }
-    if (filters.city) return { level: "city", name: filters.city };
+    if (filters.city) {
+      const selection: BoundarySelection = { level: "city", name: filters.city };
+      if (filters.province) selection.province = filters.province;
+      return selection;
+    }
     if (filters.province) return { level: "province", name: filters.province };
     return null;
   }, [filters.brgy, filters.city, filters.province]);

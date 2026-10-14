@@ -22,6 +22,12 @@ export async function getBoundaryFeature(
   if (selection.level === "barangay" && selection.city?.trim()) {
     params.set("city", selection.city.trim());
   }
+  if (
+    (selection.level === "barangay" || selection.level === "city") &&
+    selection.province?.trim()
+  ) {
+    params.set("province", selection.province.trim());
+  }
 
   const res = await fetch(`${API_PATH}?${params.toString()}`, {
     method: "GET",
