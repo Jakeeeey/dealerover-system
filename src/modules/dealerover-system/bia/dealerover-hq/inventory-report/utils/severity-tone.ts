@@ -56,3 +56,20 @@ export const STRIP_BG: Record<LowStockState, string> = {
   dropped: "bg-muted-foreground",
   unrated: "bg-muted-foreground",
 };
+
+/**
+ * Utilities-only pill styling, keyed by the semantic tone.
+ *
+ * Why not `StatusBadge`: shadcn's `Badge` defaults to the `default` variant,
+ * whose `bg-primary text-primary-foreground` utilities beat globals.css
+ * `.badge-*` component classes (utilities layer outranks components layer), so
+ * every tone renders primary blue. House files are protected, so this module
+ * renders its own pill from utilities only — same tone contract, real colours.
+ */
+export const TONE_PILL: Record<StatusTone, string> = {
+  neutral: "border-border bg-muted text-muted-foreground",
+  success: "border-success/30 bg-success-bg text-success",
+  warning: "border-warning/30 bg-warning-bg text-warning",
+  info: "border-info/30 bg-info-bg text-info",
+  destructive: "border-destructive/25 bg-destructive/10 text-destructive",
+};

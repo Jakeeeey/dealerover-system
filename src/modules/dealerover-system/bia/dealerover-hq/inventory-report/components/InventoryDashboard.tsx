@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { ArrowRight } from "lucide-react";
-import { StatusBadge } from "@/components/ui/status-badge";
+import { SeverityPill } from "./StatusPill";
 import { cn, formatCurrency, formatNumber } from "@/lib/utils";
 import type {
   DealerBranch,
@@ -19,7 +19,7 @@ import {
   SEVERITY_RANK,
   type ProductAggregate,
 } from "../utils/aggregate";
-import { CELL_WASH, STATE_LABEL, TONE_BY_STATE } from "../utils/severity-tone";
+import { CELL_WASH, STATE_LABEL } from "../utils/severity-tone";
 import { ValueBlock } from "./ValueBlock";
 
 export interface InventoryDashboardProps {
@@ -240,7 +240,7 @@ export function InventoryDashboard({
                       aria-label={`${STATE_LABEL[state]}: ${e.count} products, ${formatCurrency(e.value)} — view table`}
                       className="inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs transition-[background-color,border-color] duration-200 hover:bg-muted/60 focus-visible:outline-2 focus-visible:outline-ring"
                     >
-                      <StatusBadge tone={TONE_BY_STATE[state]}>{STATE_LABEL[state]}</StatusBadge>
+                      <SeverityPill state={state} />
                       <span className="font-semibold tabular-nums">{formatNumber(e.count, "en-PH", 0)}</span>
                       <span className="tabular-nums text-muted-foreground">{formatCurrency(e.value)}</span>
                     </button>
@@ -288,9 +288,7 @@ export function InventoryDashboard({
                         {inUnits(item.onHand, item)} on hand · {item.reason} · {formatCurrency(item.value)} at risk
                       </span>
                     </span>
-                    <StatusBadge tone={TONE_BY_STATE[item.state]} className="shrink-0">
-                      {STATE_LABEL[item.state]}
-                    </StatusBadge>
+                    <SeverityPill state={item.state} className="shrink-0" />
                   </button>
                 </li>
               ))}

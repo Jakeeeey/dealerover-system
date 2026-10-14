@@ -4,7 +4,7 @@ import * as React from "react";
 import { ArrowLeft, Loader2, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
-import { StatusBadge } from "@/components/ui/status-badge";
+import { TonePill } from "./components/StatusPill";
 import { cn, formatNumber } from "@/lib/utils";
 import { ErrorPage } from "@/app/(dealerover-system)/dealerover-system/_components/ErrorPage";
 import { DealeroverEmblemPreloader } from "@/modules/dealerover-system/bia/dealerover-hq/leaderboard/components/dealerover-emblem-preloader";
@@ -279,12 +279,6 @@ export default function InventoryReportPage() {
     );
   }, [rows, selection]);
 
-  const drawerNetwork = React.useMemo(() => {
-    if (!drawerAggregate) return [];
-    const code = drawerAggregate.productCode || `id:${drawerAggregate.productId}`;
-    return aggregates.filter((a) => (a.productCode || `id:${a.productId}`) === code);
-  }, [aggregates, drawerAggregate]);
-
   // `streaming` comes from the hook (a failed page ends the stream); deriving
   // it from progress left the "Streaming" strip up forever after a failure.
 
@@ -388,7 +382,7 @@ export default function InventoryReportPage() {
           aria-live="polite"
         >
           <Loader2 className="size-3.5 shrink-0 animate-spin text-info" aria-hidden />
-          <StatusBadge tone="info">Streaming</StatusBadge>
+          <TonePill tone="info">Streaming</TonePill>
           <span>
             Branch page {formatNumber((progress?.pagesDone ?? 0) + 1, "en-PH", 0)} of{" "}
             {formatNumber(progress?.totalPages ?? 0, "en-PH", 0)} ·{" "}
@@ -400,9 +394,9 @@ export default function InventoryReportPage() {
 
       {offline && (
         <p className="flex flex-wrap items-center gap-2 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-foreground" role="status">
-          <StatusBadge tone="warning">
+          <TonePill tone="warning">
             Dealer offline
-          </StatusBadge>
+          </TonePill>
           <span>
             {dealer.dealerName} is {offlineReason} — showing last synced data only.
           </span>
@@ -411,7 +405,7 @@ export default function InventoryReportPage() {
 
       {streamError && (
         <p className="flex flex-wrap items-center gap-2 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-foreground" role="alert">
-          <StatusBadge tone="warning">Partial data</StatusBadge>
+          <TonePill tone="warning">Partial data</TonePill>
           <span>
             {streamError} — the pages already loaded stay on screen; refresh to retry the rest.
           </span>
@@ -420,7 +414,7 @@ export default function InventoryReportPage() {
 
       {dealer && !analyticsAvailable && (
         <p className="flex flex-wrap items-center gap-2 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-foreground" role="alert">
-          <StatusBadge tone="warning">Demand data unavailable</StatusBadge>
+          <TonePill tone="warning">Demand data unavailable</TonePill>
           <span>
             The sales index for this dealer did not load, so products cannot be graded. Look for
             ERR_ANALYTICS_FAIL in the server log, then refresh.
@@ -430,7 +424,7 @@ export default function InventoryReportPage() {
 
       {dealer && analyticsAvailable && !dealerActive && (
         <p className="flex flex-wrap items-center gap-2 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-foreground" role="status">
-          <StatusBadge tone="warning">Stale demand</StatusBadge>
+          <TonePill tone="warning">Stale demand</TonePill>
           <span>
             No sales in the last {filters.windowDays} days — demand signals unavailable, showing stock-only classification.
           </span>
@@ -439,16 +433,17 @@ export default function InventoryReportPage() {
 
       {drill && drillView ? (
         <section aria-label="Drill-down table" className="space-y-3">
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          {/* The way out lives in a sticky bar: a ghost button beside a heading
+              was easy to miss once the table scrolled. */}
+          <div className="sticky top-2 z-10 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-2xl border bg-card px-3 py-2 shadow-sm">
             <Button
-              variant="ghost"
+              variant="outline"
               size="sm"
               onClick={() => setDrill(null)}
               className="h-8 gap-2 text-xs min-h-11 md:min-h-0"
-              aria-label="Back to dashboard"
             >
               <ArrowLeft className="size-4" aria-hidden />
-              Back
+              Back to dashboard
             </Button>
             <div className="min-w-0">
               <h3 className="truncate text-sm font-semibold">{drillView.title}</h3>
@@ -456,10 +451,10 @@ export default function InventoryReportPage() {
                 {drillView.summary}
               </p>
             </div>
-            <StatusBadge tone="info" className="ml-auto">
+            <TonePill tone="info" className="ml-auto">
               {formatNumber(drillView.items.length, "en-PH", 0)}{" "}
               {drillView.items.length === 1 ? "product" : "products"}
-            </StatusBadge>
+            </TonePill>
           </div>
 
           <LowStockBoard
@@ -467,7 +462,6 @@ export default function InventoryReportPage() {
             aggregates={drillView.items}
             dealers={dealer ? [dealer] : []}
             onSelect={handleSelect}
-            title={drillView.title}
             emptyHint={drillView.emptyHint}
           />
         </section>
@@ -496,7 +490,6 @@ export default function InventoryReportPage() {
         selection={selection}
         aggregate={drawerAggregate}
         branchRows={drawerBranchRows}
-        network={drawerNetwork}
         windowDays={filters.windowDays}
         lookbackDays={effectivePolicy.lookbackDays}
         leadDays={effectivePolicy.leadDays}

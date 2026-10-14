@@ -1,6 +1,6 @@
 "use client";
 
-import { StatusBadge } from "@/components/ui/status-badge";
+import { TonePill } from "./StatusPill";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { formatCurrency } from "@/lib/utils";
 
@@ -52,9 +52,9 @@ export function HeroBand({ dealerName, dealerCode, online, totalValue }: HeroBan
           </TooltipProvider>
           <p className="text-xs text-muted-foreground">Dealer inventory value</p>
         </div>
-        <StatusBadge tone={online ? "success" : "warning"} className="self-start sm:self-center">
+        <TonePill tone={online ? "success" : "warning"} className="self-start sm:self-center">
           {online ? "Online" : "Offline"}
-        </StatusBadge>
+        </TonePill>
       </div>
     </section>
   );
