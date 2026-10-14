@@ -24,6 +24,12 @@ const SOURCE_ID = "customer-points";
 const HEAT_ID = "customer-heat";
 const CIRCLE_ID = "customer-points-circle";
 
+// Same-spot stack badges (dots view): customers within ~10 m share a grid
+// cell; exactly one anchor per cell of 2+ renders a white ring + "N" badge
+// above the dots so co-location is visible without switching to Clusters.
+const STACK_GRID_DEG = 0.00003; // ~3 m: only (near-)identical spots group
+const STACK_JITTER_RADIUS_DEG = 0.000045; // ~5 m fan-out radius for stacks
+
 // Clustered copy of the same point set (a second source — never `cluster:true`
 // on the dots source, or dots mode would break). Fed the same FeatureCollection
 // whenever the filtered set changes.
@@ -164,15 +170,50 @@ interface CustomerMapViewProps {
   onToggleDealer: (dealerId: string) => void;
 }
 
+/**
+ * Builds the render FeatureCollection. When `jitter` is true, customers that
+ * share the same ~10 m grid cell are fanned around their spot on a small ring
+ * (~15 m) so a stack reads as several distinct dots — sub-pixel when zoomed out
+ * (so it never clutters) and a visible rosette as you zoom in. Cluster/heat
+ * sources pass `jitter:false` so their aggregation uses the true positions.
+ */
 function buildMappableData(
   customers: CustomerMapRow[],
   colors: Record<string, string>,
+  jitter = false,
 ): MappableData {
+  const groups = new Map<string, number[]>();
+  customers.forEach((customer, index) => {
+    const gridKey = `${Math.floor(customer.lng / STACK_GRID_DEG)}:${Math.floor(customer.lat / STACK_GRID_DEG)}`;
+    const members = groups.get(gridKey);
+    if (members) members.push(index);
+    else groups.set(gridKey, [index]);
+  });
+
+  const latOffset = new Array<number>(customers.length).fill(0);
+  const lngOffset = new Array<number>(customers.length).fill(0);
+  if (jitter) {
+    for (const members of groups.values()) {
+      const count = members.length;
+      if (count < 2) continue;
+      for (let j = 0; j < count; j += 1) {
+        const index = members[j];
+        const angle = (2 * Math.PI * j) / count;
+        latOffset[index] = Math.sin(angle) * STACK_JITTER_RADIUS_DEG;
+        const cosLat = Math.cos((customers[index].lat * Math.PI) / 180) || 1;
+        lngOffset[index] = (Math.cos(angle) * STACK_JITTER_RADIUS_DEG) / cosLat;
+      }
+    }
+  }
+
   return {
     type: "FeatureCollection",
-    features: customers.map((customer) => ({
+    features: customers.map((customer, index) => ({
       type: "Feature",
-      geometry: { type: "Point", coordinates: [customer.lng, customer.lat] },
+      geometry: {
+        type: "Point",
+        coordinates: [customer.lng + lngOffset[index], customer.lat + latOffset[index]],
+      },
       properties: {
         key: customer.key,
         dealerId: customer.dealerId,
@@ -680,25 +721,27 @@ export function CustomerMapView({
   const applyLayers = React.useCallback((map: MapLibreMap) => {
     const state = latest.current;
     try {
-      const data = buildMappableData(state.customers, state.colors);
+      // Dots fan stacked customers out (jitter); clusters keep true positions.
+      const data = buildMappableData(state.customers, state.colors, true);
+      const clusterData = buildMappableData(state.customers, state.colors, false);
       const existing = map.getSource(SOURCE_ID) as GeoJSONSource | undefined;
       if (!existing) map.addSource(SOURCE_ID, { type: "geojson", data });
       else existing.setData(data);
 
-      // Clustered twin of the dots source — same data, MapLibre aggregates nearby
-      // points into point_count clusters. Kept as a separate source so the dots
-      // source stays unclustered for dots/heatmap modes.
+      // Clustered twin of the dots source — MapLibre aggregates nearby points
+      // into point_count clusters, using the TRUE positions (no jitter). Kept as
+      // a separate source so the dots source stays unclustered for dots/heatmap.
       const existingCluster = map.getSource(CLUSTER_SOURCE_ID) as GeoJSONSource | undefined;
       if (!existingCluster) {
         map.addSource(CLUSTER_SOURCE_ID, {
           type: "geojson",
-          data,
+          data: clusterData,
           cluster: true,
           clusterRadius: 44,
           clusterMaxZoom: 14,
         });
       } else {
-        existingCluster.setData(data);
+        existingCluster.setData(clusterData);
       }
 
       if (!map.getLayer(HEAT_ID)) {
@@ -796,8 +839,9 @@ export function CustomerMapView({
       };
       const isHeat = state.markerStyle === "heatmap";
       const isClusters = state.markerStyle === "clusters";
+      const isDots = !isHeat && !isClusters;
       show(HEAT_ID, isHeat);
-      show(CIRCLE_ID, !isHeat && !isClusters);
+      show(CIRCLE_ID, isDots);
       show(CLUSTER_CIRCLE_ID, isClusters);
       show(CLUSTER_COUNT_ID, isClusters);
       show(CLUSTER_POINT_ID, isClusters);
