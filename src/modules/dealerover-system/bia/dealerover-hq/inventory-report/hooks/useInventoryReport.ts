@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   DealerBranch,
   DealerRosterEntry,
@@ -8,11 +8,12 @@ import type {
   InventoryProgress,
   InventoryRow,
   MasterProduct,
-  StockOutItem,
+  ProductDemand,
 } from "../types";
 import {
   BRANCH_PAGE_SIZE,
   getDealerRoster,
+  getInventoryAnalytics,
   getInventoryMeta,
   getInventoryPage,
 } from "../providers/inventory-report-provider";
@@ -23,6 +24,7 @@ export interface InventoryReportQuery {
   dealerId: string | null;
   includeZero: boolean;
   windowDays: number;
+  lookbackDays: number;
 }
 
 export interface InventoryReportResult {
@@ -32,7 +34,16 @@ export interface InventoryReportResult {
   branches: DealerBranch[];
   products: MasterProduct[];
   rows: InventoryRow[];
-  stockOuts: StockOutItem[];
+  /** Per-product demand index covering the whole invoiced catalogue. */
+  analytics: ProductDemand[];
+  /** ISO date of the dealer's most recent invoice; "" when it has none. */
+  lastInvoiceAt: string;
+  /**
+   * True only once a demand index has actually loaded. A failed read must never
+   * be mistaken for "this dealer sold nothing" — that would flip the whole
+   * catalogue to dead/dropped.
+   */
+  analyticsAvailable: boolean;
   progress: InventoryProgress;
   /** True only while branch pages are landing; a failed page ends the stream. */
   streaming: boolean;
@@ -57,12 +68,14 @@ function messageOf(err: unknown, fallback: string): string {
 /**
  * Loads one dealer's inventory progressively: roster once, then the dealer
  * meta (branches + product master), then one branch-batch page at a time,
- * merging rows as each lands. A wave/generation counter plus a per-wave
- * AbortController guarantees a dealer switch can never be overwritten by an
- * older page response. Failures land in `error` and are never thrown.
+ * merging rows as each lands. The per-product demand index flies alongside
+ * meta (dealer id only) and never delays paging; its failure is non-fatal.
+ * A wave/generation counter plus a per-wave AbortController guarantees a
+ * dealer switch can never be overwritten by an older page response. Failures
+ * land in `error` and are never thrown.
  */
 export function useInventoryReport(query: InventoryReportQuery): InventoryReportResult {
-  const { dealerId: wantedDealerId, includeZero, windowDays } = query;
+  const { dealerId: wantedDealerId, includeZero, windowDays, lookbackDays } = query;
 
   const [roster, setRoster] = useState<DealerRosterEntry[] | null>(null);
   const [rosterLoading, setRosterLoading] = useState(true);
@@ -70,6 +83,9 @@ export function useInventoryReport(query: InventoryReportQuery): InventoryReport
   const [branches, setBranches] = useState<DealerBranch[]>([]);
   const [products, setProducts] = useState<MasterProduct[]>([]);
   const [rows, setRows] = useState<InventoryRow[]>([]);
+  const [analytics, setAnalytics] = useState<ProductDemand[]>([]);
+  const [analyticsAvailable, setAnalyticsAvailable] = useState(false);
+  const [lastInvoiceAt, setLastInvoiceAt] = useState("");
   const [progress, setProgress] = useState<InventoryProgress>(EMPTY_PROGRESS);
   const [metaLoading, setMetaLoading] = useState(false);
   const [streaming, setStreaming] = useState(false);
@@ -128,8 +144,38 @@ export function useInventoryReport(query: InventoryReportQuery): InventoryReport
     setDealer(null);
     setBranches([]);
     setProducts([]);
+    setAnalytics([]);
+    setAnalyticsAvailable(false);
+    setLastInvoiceAt("");
     setMetaLoading(true);
     setStreaming(false);
+
+    // The demand index only needs the dealer id, so it flies alongside meta
+    // and never delays paging. A failure is non-fatal: the client keeps an
+    // empty index and no error.
+    void getInventoryAnalytics(dealerId, {
+      windowDays,
+      lookbackDays,
+      refresh: wave.bypassCache,
+      signal: controller.signal,
+    }).then(
+      (analyticsRes) => {
+        if (generation !== generationRef.current) return;
+        setAnalytics(analyticsRes.success ? analyticsRes.products : []);
+        setAnalyticsAvailable(analyticsRes.success);
+        setLastInvoiceAt(analyticsRes.lastInvoiceAt ?? "");
+      },
+      (err: unknown) => {
+        if (isAbort(err)) return;
+        console.error(
+          `ERR_ANALYTICS_FAIL: [InventoryReport] Demand index failed for dealer "${dealerId}":`,
+          err,
+        );
+        if (generation !== generationRef.current) return;
+        setAnalytics([]);
+        setLastInvoiceAt("");
+      },
+    );
 
     async function run() {
       let meta;
@@ -204,40 +250,7 @@ export function useInventoryReport(query: InventoryReportQuery): InventoryReport
       controller.abort();
     };
     // Wave inputs: effective dealer, filters, and the refresh counter.
-  }, [effectiveDealerId, windowDays, includeZero, wave]);
-
-  // Every master product whose summed on-hand across streamed rows is zero.
-  const stockOuts = useMemo<StockOutItem[]>(() => {
-    if (!dealer || !dealer.online || products.length === 0) return [];
-    // Only meaningful once every branch page has landed: while pages are still
-    // streaming, a product whose stock has not arrived yet would read as OUT.
-    const complete = progress.totalPages > 0 && progress.pagesDone === progress.totalPages;
-    if (!complete) return [];
-    const onHandByProduct = new Map<number, number>();
-    const branchIds = new Set<number>();
-    for (const row of rows) {
-      branchIds.add(row.branchId);
-      onHandByProduct.set(row.productId, (onHandByProduct.get(row.productId) ?? 0) + row.onHand);
-    }
-    const branchCount = branchIds.size;
-    const out: StockOutItem[] = [];
-    for (const p of products) {
-      if ((onHandByProduct.get(p.productId) ?? 0) !== 0) continue;
-      out.push({
-        key: `${dealer.dealerId}:stockout:${p.productId}`,
-        dealerId: dealer.dealerId,
-        dealerName: dealer.dealerName,
-        productId: p.productId,
-        productCode: p.productCode,
-        productName: p.productName,
-        brand: p.brand,
-        category: p.category,
-        costPerUnit: p.costPerUnit,
-        branchCount,
-      });
-    }
-    return out;
-  }, [dealer, products, rows, progress.pagesDone, progress.totalPages]);
+  }, [effectiveDealerId, windowDays, lookbackDays, includeZero, wave]);
 
   const isLoading = rosterLoading || metaLoading || streaming;
 
@@ -249,7 +262,9 @@ export function useInventoryReport(query: InventoryReportQuery): InventoryReport
     branches,
     products,
     rows,
-    stockOuts,
+    analytics,
+    analyticsAvailable,
+    lastInvoiceAt,
     progress,
     isLoading,
     error,

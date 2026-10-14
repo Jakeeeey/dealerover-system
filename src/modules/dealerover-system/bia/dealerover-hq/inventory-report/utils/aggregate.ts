@@ -1,10 +1,13 @@
-import type { BranchKind, DealerBranch, InventoryRow, LowStockPolicy, LowStockState } from "../types";
-import {
-  computeSeverity,
-  effectiveMinPieces,
-  inventoryValue,
-  peerMedianFor,
-} from "./low-stock";
+import type {
+  BranchKind,
+  DealerBranch,
+  InventoryRow,
+  LowStockPolicy,
+  LowStockState,
+  MasterProduct,
+  ProductDemand,
+} from "../types";
+import { computeSeverity, inventoryValue } from "./low-stock";
 
 export interface ProductAggregate {
   key: string;
@@ -20,18 +23,25 @@ export interface ProductAggregate {
   unitName: string;
   unitCount: number;
   costPerUnit: number;
-  maintainingQuantity: number;
   onHand: number;
+  /** Pieces sold inside the demand window (this product, all branches). */
   demandQty: number;
-  movementAfter: number;
+  /** Pieces sold inside the longer not-selling lookback. */
+  demandLookback: number;
+  /** ISO date of the product's most recent sale; "" when never sold. */
+  lastSaleAt: string;
   branchCount: number;
   value: number;
   state: LowStockState;
   reason: string;
   reasonSource: string;
   daysOfCover: number | null;
-  effectiveMin: number;
-  minSource: "maintain" | "override" | "category" | "policy";
+}
+
+export interface AggregateDealer {
+  dealerId: string;
+  dealerName: string;
+  dealerCode: string;
 }
 
 export const SEVERITY_RANK: Record<LowStockState, number> = {
@@ -40,115 +50,24 @@ export const SEVERITY_RANK: Record<LowStockState, number> = {
   low: 2,
   watch: 3,
   dead: 4,
-  healthy: 5,
-  overstock: 6,
+  overstock: 5,
+  healthy: 6,
+  unrated: 7,
+  dropped: 8,
 };
 
 /**
- * Rolls branch rows up to one dealer x product aggregate and classifies each
- * with the shared severity rules. Peer medians are computed per productCode
- * across the whole network (product-level on-hand sums).
+ * States that count as a problem. Healthy means fine; unrated means there
+ * is no recent demand to judge by; dropped means the product no longer
+ * sells and holds no stock — none of the three is an alarm.
  */
-export function buildProductAggregates(rows: InventoryRow[], policy: LowStockPolicy): ProductAggregate[] {
-  const byKey = new Map<string, InventoryRow[]>();
-  for (const row of rows) {
-    const key = `${row.dealerId}:${row.productId}`;
-    const list = byKey.get(key);
-    if (list) list.push(row);
-    else byKey.set(key, [row]);
-  }
-
-  const byCode = new Map<string, number[]>();
-  const aggregates: ProductAggregate[] = [];
-
-  const prelim = Array.from(byKey.entries()).map(([key, list]) => {
-    const first = list[0];
-    const onHand = list.reduce((sum, r) => sum + r.onHand, 0);
-    const demandQty = list.reduce((sum, r) => sum + r.demandQty, 0);
-    const movementAfter = list.reduce((sum, r) => sum + r.movementAfter, 0);
-    const unitCount = list.find((r) => r.unitCount > 0)?.unitCount ?? 0;
-    const costPerUnit = list.find((r) => r.costPerUnit > 0)?.costPerUnit ?? 0;
-    const maintainingQuantity = list.reduce((max, r) => Math.max(max, r.maintainingQuantity), 0);
-    const branchCount = new Set(list.map((r) => r.branchId)).size;
-    const value = list.reduce((sum, r) => sum + inventoryValue(r.onHand, r.unitCount, r.costPerUnit), 0);
-    return { key, first, list, onHand, demandQty, movementAfter, unitCount, costPerUnit, maintainingQuantity, branchCount, value };
-  });
-
-  for (const p of prelim) {
-    const code = p.first.productCode || `id:${p.first.productId}`;
-    const arr = byCode.get(code);
-    if (arr) arr.push(p.onHand);
-    else byCode.set(code, [p.onHand]);
-  }
-
-  const medianByCode = new Map<string, number | null>();
-  for (const [code, hands] of byCode) {
-    medianByCode.set(code, peerMedianFor(hands.map((onHand) => ({ onHand }))));
-  }
-
-  for (const p of prelim) {
-    const code = p.first.productCode || `id:${p.first.productId}`;
-    const { min, source } = effectiveMinPieces(
-      {
-        maintainingQuantity: p.maintainingQuantity,
-        productCategory: p.first.productCategory,
-        productId: p.first.productId,
-        dealerId: p.first.dealerId,
-        unitCount: p.unitCount,
-      },
-      policy,
-    );
-    const severity = computeSeverity({
-      onHand: p.onHand,
-      demandQty: p.demandQty,
-      windowDays: policy.windowDays,
-      movementAfter: p.movementAfter,
-      effectiveMin: min,
-      unitCount: p.unitCount,
-      leadDays: policy.leadDays,
-      peerMedian: medianByCode.get(code) ?? null,
-      unitName: p.first.unitName,
-    });
-    aggregates.push({
-      key: p.key,
-      dealerId: p.first.dealerId,
-      dealerName: p.first.dealerName,
-      dealerCode: p.first.dealerCode,
-      productId: p.first.productId,
-      productCode: p.first.productCode,
-      productName: p.first.productName,
-      brand: p.first.productBrand,
-      category: p.first.productCategory,
-      supplier: p.first.supplierShortcut,
-      unitName: p.first.unitName,
-      unitCount: p.unitCount,
-      costPerUnit: p.costPerUnit,
-      maintainingQuantity: p.maintainingQuantity,
-      onHand: p.onHand,
-      demandQty: p.demandQty,
-      movementAfter: p.movementAfter,
-      branchCount: p.branchCount,
-      value: p.value,
-      state: severity.state,
-      reason: severity.reason,
-      reasonSource: severity.source,
-      daysOfCover: severity.numbers.daysOfCover,
-      effectiveMin: min,
-      minSource: source,
-    });
-  }
-
-  return aggregates;
-}
-
-/** Every non-healthy severity — anything that is not "healthy" counts as flagged. */
-const FLAGGED_STATES: ReadonlySet<LowStockState> = new Set([
+export const FLAGGED_STATES: ReadonlySet<LowStockState> = new Set([
   "out",
   "critical",
   "low",
   "watch",
-  "overstock",
   "dead",
+  "overstock",
 ]);
 
 const ALL_STATES: readonly LowStockState[] = [
@@ -156,10 +75,136 @@ const ALL_STATES: readonly LowStockState[] = [
   "critical",
   "low",
   "watch",
-  "healthy",
-  "overstock",
   "dead",
+  "overstock",
+  "healthy",
+  "unrated",
+  "dropped",
 ];
+
+function demandIndex(analytics: ProductDemand[]): Map<number, ProductDemand> {
+  const map = new Map<number, ProductDemand>();
+  for (const entry of analytics) {
+    if (!map.has(entry.productId)) map.set(entry.productId, entry);
+  }
+  return map;
+}
+
+function resolveDealer(
+  rows: InventoryRow[],
+  dealer: AggregateDealer | undefined,
+): AggregateDealer {
+  if (dealer) return dealer;
+  const first = rows[0];
+  return {
+    dealerId: first?.dealerId ?? "",
+    dealerName: first?.dealerName ?? "",
+    dealerCode: first?.dealerCode ?? "",
+  };
+}
+
+/**
+ * Rolls branch rows up to one dealer x product aggregate and classifies
+ * each with the shared analytics ladder. Emits one entry per MASTER
+ * product, so the whole catalogue is classified: products with no stock
+ * rows get onHand 0 with pack size / cost from the master and demand
+ * from the analytics index — which is what tells a true stock-out (live
+ * demand, nothing on hand) apart from a dropped product (no sales in the
+ * lookback, no stock) and dead stock (no sales in the lookback, still
+ * holding units).
+ */
+export function buildProductAggregates(
+  rows: InventoryRow[],
+  master: MasterProduct[],
+  analytics: ProductDemand[],
+  policy: LowStockPolicy,
+  dealerActive: boolean,
+  analyticsAvailable: boolean,
+  dealer?: AggregateDealer,
+): ProductAggregate[] {
+  const identity = resolveDealer(rows, dealer);
+  const demandByProduct = demandIndex(analytics);
+
+  const rowsByProduct = new Map<number, InventoryRow[]>();
+  for (const row of rows) {
+    const list = rowsByProduct.get(row.productId);
+    if (list) list.push(row);
+    else rowsByProduct.set(row.productId, [row]);
+  }
+
+  const masterById = new Map<number, MasterProduct>();
+  for (const product of master) {
+    if (!masterById.has(product.productId)) masterById.set(product.productId, product);
+  }
+
+  // Whole catalogue: every master product, plus any row-only product the
+  // master no longer lists (kept so streaming rows are never dropped).
+  const productIds = new Set<number>([...masterById.keys(), ...rowsByProduct.keys()]);
+
+  const aggregates: ProductAggregate[] = [];
+  for (const productId of productIds) {
+    const list = rowsByProduct.get(productId) ?? [];
+    const info = masterById.get(productId);
+    const first = list[0];
+    const demand = demandByProduct.get(productId);
+
+    const onHand = list.reduce((sum, r) => sum + r.onHand, 0);
+    const demandQty =
+      demand?.demandWindow ?? list.reduce((sum, r) => sum + r.demandQty, 0);
+    const demandLookback = demand?.demandLookback ?? 0;
+    const lastSaleAt = demand?.lastSaleAt ?? "";
+    const unitCount =
+      list.find((r) => r.unitCount > 0)?.unitCount ?? info?.unitCount ?? 0;
+    const costPerUnit =
+      list.find((r) => r.costPerUnit > 0)?.costPerUnit ?? info?.costPerUnit ?? 0;
+    const branchCount = new Set(list.map((r) => r.branchId)).size;
+    const value = list.reduce(
+      (sum, r) => sum + inventoryValue(r.onHand, r.unitCount, r.costPerUnit),
+      0,
+    );
+
+    const severity = computeSeverity({
+      onHand,
+      demandWindow: demandQty,
+      demandLookback,
+      lastSaleAt,
+      windowDays: policy.windowDays,
+      leadDays: policy.leadDays,
+      lookbackDays: policy.lookbackDays,
+      dealerActive,
+      analyticsAvailable,
+      unitCount,
+    });
+
+    aggregates.push({
+      key: `${identity.dealerId}:${productId}`,
+      dealerId: identity.dealerId || first?.dealerId || "",
+      dealerName: identity.dealerName || first?.dealerName || "",
+      dealerCode: identity.dealerCode || first?.dealerCode || "",
+      productId,
+      productCode: first?.productCode || info?.productCode || "",
+      productName: first?.productName || info?.productName || `Product ${productId}`,
+      brand: first?.productBrand || info?.brand || "",
+      category: first?.productCategory || info?.category || "",
+      supplier: first?.supplierShortcut || "",
+      unitName: first?.unitName || "",
+      unitCount,
+      costPerUnit,
+      onHand,
+      demandQty,
+      demandLookback,
+      lastSaleAt,
+      branchCount,
+      value,
+      state: severity.state,
+      reason: severity.reason,
+      reasonSource: severity.source,
+      daysOfCover: severity.numbers.daysOfCover,
+    });
+  }
+
+  return aggregates;
+}
 
 export interface DimensionGroup {
   key: string;
@@ -167,6 +212,8 @@ export interface DimensionGroup {
   productCount: number;
   flaggedCount: number;
   value: number;
+  /** Pesos tied up in this group's flagged members — the block's area. */
+  flaggedValue: number;
   worst: LowStockState;
 }
 
@@ -196,11 +243,15 @@ export function groupByDimension(
   for (const [key, members] of membersByKey) {
     let flaggedCount = 0;
     let value = 0;
+    let flaggedValue = 0;
     let worst: LowStockState = "healthy";
     let worstRank = Number.POSITIVE_INFINITY;
     for (const member of members) {
       value += member.value;
-      if (FLAGGED_STATES.has(member.state)) flaggedCount += 1;
+      if (FLAGGED_STATES.has(member.state)) {
+        flaggedCount += 1;
+        flaggedValue += member.value;
+      }
       const rank = SEVERITY_RANK[member.state];
       if (rank < worstRank) {
         worstRank = rank;
@@ -213,11 +264,13 @@ export function groupByDimension(
       productCount: members.length,
       flaggedCount,
       value,
+      flaggedValue,
       worst,
     });
   }
 
-  groups.sort((a, b) => b.flaggedCount - a.flaggedCount || b.value - a.value);
+  // Largest trapped value first: the concentration block sizes by it.
+  groups.sort((a, b) => b.flaggedValue - a.flaggedValue || b.flaggedCount - a.flaggedCount);
   return groups;
 }
 
@@ -230,59 +283,43 @@ export interface BranchAggregate {
   counts: Record<LowStockState, number>;
   onHand: number;
   value: number;
+  /** Pesos tied up in this branch's flagged products — the block's area. */
+  flaggedValue: number;
   worst: LowStockState;
 }
 
 /**
  * Rolls branch rows up per branch and classifies every product-branch ROW
- * with the shared severity rules (same per-productCode peer-median idea as
- * buildProductAggregates, but at row granularity). Joined to the branch's
- * kind; ordered by flagged count, then value at risk.
+ * with the shared analytics ladder (the row's own demandQty is the window
+ * demand; the lookback demand and last-sale date come from the
+ * product-level analytics index). Joined to the branch's kind; ordered by
+ * flagged count, then value at risk.
  */
 export function buildBranchAggregates(
   rows: InventoryRow[],
   branches: DealerBranch[],
   policy: LowStockPolicy,
+  analytics: ProductDemand[],
+  dealerActive: boolean,
+  analyticsAvailable: boolean,
 ): BranchAggregate[] {
-  const handsByCode = new Map<string, number[]>();
-  for (const row of rows) {
-    const code = row.productCode || `id:${row.productId}`;
-    const hands = handsByCode.get(code);
-    if (hands) hands.push(row.onHand);
-    else handsByCode.set(code, [row.onHand]);
-  }
-  const medianByCode = new Map<string, number | null>();
-  for (const [code, hands] of handsByCode) {
-    medianByCode.set(
-      code,
-      peerMedianFor(hands.map((onHand) => ({ onHand }))),
-    );
-  }
+  const demandByProduct = demandIndex(analytics);
 
   const rowsByBranch = new Map<number, InventoryRow[]>();
   const statesByBranch = new Map<number, LowStockState[]>();
   for (const row of rows) {
-    const code = row.productCode || `id:${row.productId}`;
-    const { min } = effectiveMinPieces(
-      {
-        maintainingQuantity: row.maintainingQuantity,
-        productCategory: row.productCategory,
-        productId: row.productId,
-        dealerId: row.dealerId,
-        unitCount: row.unitCount,
-      },
-      policy,
-    );
+    const demand = demandByProduct.get(row.productId);
     const severity = computeSeverity({
       onHand: row.onHand,
-      demandQty: row.demandQty,
+      demandWindow: row.demandQty,
+      demandLookback: demand?.demandLookback ?? 0,
+      lastSaleAt: demand?.lastSaleAt ?? "",
       windowDays: policy.windowDays,
-      movementAfter: row.movementAfter,
-      effectiveMin: min,
-      unitCount: row.unitCount,
       leadDays: policy.leadDays,
-      peerMedian: medianByCode.get(code) ?? null,
-      unitName: row.unitName,
+      lookbackDays: policy.lookbackDays,
+      dealerActive,
+      analyticsAvailable,
+      unitCount: row.unitCount,
     });
     const rowList = rowsByBranch.get(row.branchId);
     if (rowList) rowList.push(row);
@@ -308,11 +345,13 @@ export function buildBranchAggregates(
     let flaggedCount = 0;
     let onHand = 0;
     let value = 0;
+    let flaggedValue = 0;
     let worst: LowStockState = "healthy";
     let worstRank = Number.POSITIVE_INFINITY;
     states.forEach((state, index) => {
       counts[state] += 1;
-      if (FLAGGED_STATES.has(state)) flaggedCount += 1;
+      const flagged = FLAGGED_STATES.has(state);
+      if (flagged) flaggedCount += 1;
       const rank = SEVERITY_RANK[state];
       if (rank < worstRank) {
         worstRank = rank;
@@ -321,7 +360,9 @@ export function buildBranchAggregates(
       const row = list[index];
       if (row) {
         onHand += row.onHand;
-        value += inventoryValue(row.onHand, row.unitCount, row.costPerUnit);
+        const rowValue = inventoryValue(row.onHand, row.unitCount, row.costPerUnit);
+        value += rowValue;
+        if (flagged) flaggedValue += rowValue;
       }
     });
     out.push({
@@ -333,10 +374,11 @@ export function buildBranchAggregates(
       counts,
       onHand,
       value,
+      flaggedValue,
       worst,
     });
   }
 
-  out.sort((a, b) => b.flaggedCount - a.flaggedCount || b.value - a.value);
+  out.sort((a, b) => b.flaggedValue - a.flaggedValue || b.flaggedCount - a.flaggedCount);
   return out;
 }

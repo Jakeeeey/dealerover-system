@@ -1,26 +1,28 @@
-import type { InventoryRow, LowStockPolicy, LowStockState } from "../types";
+import type { LowStockState } from "../types";
 
-export type ReasonSource = "demand" | "relative" | "minimum" | "none";
+export type ReasonSource = "demand" | "none";
 
 export interface SeverityNumbers {
   onHand: number;
-  demandQty: number;
+  demandWindow: number;
+  demandLookback: number;
   windowDays: number;
   daysOfCover: number | null;
-  effectiveMin: number;
   unitCount: number;
 }
 
 export interface SeverityInput {
   onHand: number;
-  demandQty: number;
+  demandWindow: number;
+  demandLookback: number;
+  lastSaleAt: string;
   windowDays: number;
-  movementAfter: number;
-  effectiveMin: number;
-  unitCount: number;
   leadDays: number;
-  peerMedian: number | null;
-  unitName?: string;
+  lookbackDays: number;
+  dealerActive: boolean;
+  /** False when the demand index could not be loaded — nothing can be judged. */
+  analyticsAvailable: boolean;
+  unitCount: number;
 }
 
 export interface SeverityResult {
@@ -37,25 +39,14 @@ function formatDays(value: number): string {
   return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
 }
 
-function formatCases(pieces: number, unitCount: number, unitName?: string): string {
-  const unit = (unitName ?? "").trim();
-  if (unit) {
-    if (!Number.isFinite(unitCount) || unitCount <= 0) return `${Math.round(pieces)} ${unit}`;
-    const units = pieces / unitCount;
-    const rounded = Math.round(units * 10) / 10;
-    const label = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
-    return `${label} ${unit}`;
-  }
-  if (!Number.isFinite(unitCount) || unitCount <= 0) return `${Math.round(pieces)} pcs`;
-  const cases = pieces / unitCount;
-  const rounded = Math.round(cases * 10) / 10;
-  const label = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
-  return `${label} ${rounded === 1 ? "case" : "cases"}`;
+function formatDaily(demandWindow: number, windowDays: number): string {
+  if (!Number.isFinite(demandWindow) || !Number.isFinite(windowDays) || windowDays <= 0) return "0";
+  return formatDays(Math.max(0, demandWindow) / windowDays);
 }
 
 /**
  * Days of cover = on-hand pieces / average daily demand over the window.
- * Returns null when there is no demand signal (no invoices in the window).
+ * Returns null when there is no demand signal (no sales in the window).
  */
 export function daysOfCover(
   onHand: number,
@@ -86,130 +77,121 @@ export function inventoryValue(pieces: number, unitCount: number, costPerUnit: n
 }
 
 /**
- * Pure severity classifier for one branch-level inventory row.
- * Demand cover wins when demand exists; otherwise the relative peer-median
- * rule and the minimum-threshold rule decide.
+ * Whole days since an ISO date string. Returns null for empty/unparsable
+ * dates ("" means the product has never sold).
+ */
+export function daysSince(dateIso: string, now: number = Date.now()): number | null {
+  if (!dateIso) return null;
+  const time = Date.parse(dateIso);
+  if (!Number.isFinite(time)) return null;
+  return Math.max(0, Math.floor((now - time) / (24 * 60 * 60 * 1000)));
+}
+
+/**
+ * Pure analytics classifier. No configured minimums: the state comes from
+ * the product's own sales history (window demand, lookback demand,
+ * last-sale date) plus whether the dealer itself is still selling.
+ *
+ * Decision ladder, evaluated in order:
+ *  0. Demand index unavailable → unrated (never guess from an empty index).
+ *  1. Nothing sold in the lookback → dead (holding stock) or dropped
+ *     (no stock either — likely delisted).
+ *  2. Dealer has no invoices in the window → unrated (no demand signal).
+ *  3. Product has no sales in the window → unrated (nothing to judge by).
+ *  4. No stock but live demand → out (a true stock-out).
+ *  5. Otherwise rank by measured days of cover.
  */
 export function computeSeverity(input: SeverityInput): SeverityResult {
-  const { onHand, demandQty, windowDays, movementAfter, effectiveMin, unitCount, leadDays, peerMedian, unitName } =
-    input;
-  const safeOnHand = Number.isFinite(onHand) ? onHand : 0;
-  const doc = daysOfCover(safeOnHand, demandQty, windowDays);
+  const {
+    onHand,
+    demandWindow,
+    demandLookback,
+    windowDays,
+    leadDays,
+    lookbackDays,
+    dealerActive,
+    analyticsAvailable,
+    unitCount,
+  } = input;
+  const safeOnHand = Number.isFinite(onHand) ? Math.max(0, onHand) : 0;
+  const safeWindow = Number.isFinite(demandWindow) ? Math.max(0, demandWindow) : 0;
+  const safeLookback = Number.isFinite(demandLookback) ? Math.max(0, demandLookback) : 0;
+  const doc = daysOfCover(safeOnHand, safeWindow, windowDays);
   const numbers: SeverityNumbers = {
     onHand: safeOnHand,
-    demandQty: Number.isFinite(demandQty) ? demandQty : 0,
+    demandWindow: safeWindow,
+    demandLookback: safeLookback,
     windowDays,
     daysOfCover: doc,
-    effectiveMin: Number.isFinite(effectiveMin) ? effectiveMin : 0,
     unitCount: Number.isFinite(unitCount) && unitCount > 0 ? unitCount : 0,
   };
 
-  if (safeOnHand <= 0) {
-    return { state: "out", reason: "stock-out", source: "demand", numbers };
+  // An unloaded demand index is not evidence of anything: never let a failed
+  // read flip the whole catalogue to dead/dropped.
+  if (!analyticsAvailable) {
+    return { state: "unrated", reason: "demand data unavailable", source: "none", numbers };
   }
 
-  const noMovement = movementAfter === 0;
-  const noDemand = !Number.isFinite(demandQty) || demandQty <= 0;
-
-  if (doc !== null) {
-    if (doc < 3) {
+  if (safeLookback <= 0) {
+    if (safeOnHand > 0) {
       return {
-        state: "critical",
-        reason: `${formatDays(doc)} days cover vs ${leadDays}-day minimum`,
+        state: "dead",
+        reason: `no sales in ${lookbackDays} days`,
         source: "demand",
         numbers,
       };
     }
-    if (doc < leadDays) {
-      return {
-        state: "low",
-        reason: `${formatDays(doc)} days cover vs ${leadDays}-day minimum`,
-        source: "demand",
-        numbers,
-      };
-    }
-    if (doc < 2 * leadDays) {
-      return {
-        state: "watch",
-        reason: `${formatDays(doc)} days cover vs ${leadDays}-day minimum`,
-        source: "demand",
-        numbers,
-      };
-    }
-    if (doc > 60) {
-      return { state: "overstock", reason: `${formatDays(doc)} days cover on hand`, source: "demand", numbers };
-    }
-    if (noMovement && noDemand) {
-      return { state: "dead", reason: "no movement and no demand", source: "demand", numbers };
-    }
-    return { state: "healthy", reason: `${formatDays(doc)} days cover`, source: "demand", numbers };
-  }
-
-  // No demand signal — relative peer-median rule first.
-  if (peerMedian !== null && Number.isFinite(peerMedian) && peerMedian > 0) {
-    const ratio = safeOnHand / peerMedian;
-    if (ratio < 0.5) {
-      const pct = Math.round((1 - ratio) * 100);
-      return {
-        state: "low",
-        reason: `${pct}% below peer median (${formatCases(safeOnHand, unitCount, unitName)} vs ${formatCases(peerMedian, unitCount, unitName)} median)`,
-        source: "relative",
-        numbers,
-      };
-    }
-  }
-
-  // Minimum-threshold rule.
-  if (numbers.effectiveMin > 0 && safeOnHand < numbers.effectiveMin) {
     return {
-      state: "low",
-      reason: `${formatCases(safeOnHand, unitCount, unitName)} vs ${formatCases(numbers.effectiveMin, unitCount, unitName)} minimum`,
-      source: "minimum",
+      state: "dropped",
+      reason: `no sales in ${lookbackDays} days and no stock`,
+      source: "demand",
       numbers,
     };
   }
 
-  if (noMovement && noDemand) {
-    return { state: "dead", reason: "no movement and no demand", source: "none", numbers };
+  if (!dealerActive) {
+    return {
+      state: "unrated",
+      reason: `dealer has no sales in the last ${windowDays} days`,
+      source: "none",
+      numbers,
+    };
   }
 
-  return { state: "healthy", reason: "within threshold", source: "none", numbers };
-}
+  if (safeWindow <= 0) {
+    return {
+      state: "unrated",
+      reason: `no sales in the last ${windowDays} days`,
+      source: "none",
+      numbers,
+    };
+  }
 
-/**
- * Effective minimum in PIECES for a row.
- * Maintain basis wins when the product master carries a maintaining quantity;
- * otherwise the per-item override, then the per-category minimum, then the
- * policy default (in display units, converted via pack size).
- */
-export function effectiveMinPieces(
-  row: Pick<InventoryRow, "maintainingQuantity" | "productCategory" | "productId" | "dealerId" | "unitCount">,
-  policy: LowStockPolicy,
-): { min: number; source: "maintain" | "override" | "category" | "policy" } {
-  if (policy.basis === "maintain" && row.maintainingQuantity > 0) {
-    return { min: row.maintainingQuantity, source: "maintain" };
+  if (safeOnHand <= 0) {
+    return {
+      state: "out",
+      reason: `stock-out · ${formatDaily(safeWindow, windowDays)}/day demand`,
+      source: "demand",
+      numbers,
+    };
   }
-  const overrideKey = `${row.dealerId}:${row.productId}`;
-  const override = policy.overrides[overrideKey];
-  if (typeof override === "number" && Number.isFinite(override) && override >= 0) {
-    return { min: override, source: "override" };
-  }
-  const categoryMinCases = policy.categoryMin[row.productCategory];
-  if (typeof categoryMinCases === "number" && Number.isFinite(categoryMinCases) && categoryMinCases > 0) {
-    return { min: categoryMinCases * Math.max(row.unitCount, 0), source: "category" };
-  }
-  if (policy.defaultMinCases > 0) {
-    return { min: policy.defaultMinCases * Math.max(row.unitCount, 0), source: "policy" };
-  }
-  return { min: 0, source: "policy" };
-}
 
-/** Median on-hand (pieces) for one productCode across the network. */
-export function peerMedianFor(rows: { onHand: number }[]): number | null {
-  if (rows.length === 0) return null;
-  const sorted = rows.map((r) => r.onHand).filter((n) => Number.isFinite(n)).sort((a, b) => a - b);
-  if (sorted.length === 0) return null;
-  const mid = Math.floor(sorted.length / 2);
-  if (sorted.length % 2 === 1) return sorted[mid];
-  return (sorted[mid - 1] + sorted[mid]) / 2;
+  const cover = doc ?? 0;
+  const daily = formatDaily(safeWindow, windowDays);
+  const coverReason = `${formatDays(cover)} days cover at ${daily}/day demand`;
+  const safeLead = Number.isFinite(leadDays) && leadDays > 0 ? leadDays : 7;
+
+  if (cover < 3) {
+    return { state: "critical", reason: coverReason, source: "demand", numbers };
+  }
+  if (cover < safeLead) {
+    return { state: "low", reason: coverReason, source: "demand", numbers };
+  }
+  if (cover < 2 * safeLead) {
+    return { state: "watch", reason: coverReason, source: "demand", numbers };
+  }
+  if (cover > 60) {
+    return { state: "overstock", reason: coverReason, source: "demand", numbers };
+  }
+  return { state: "healthy", reason: coverReason, source: "demand", numbers };
 }

@@ -4,6 +4,7 @@ import { COOKIE_NAME } from "@/lib/auth-utils";
 import {
   BRANCH_PAGE_SIZE,
   fetchDealerRoster,
+  fetchInventoryAnalytics,
   fetchInventoryMeta,
   fetchInventoryPage,
 } from "@/modules/dealerover-system/bia/dealerover-hq/inventory-report/services/inventory-report-service";
@@ -14,6 +15,12 @@ export const dynamic = "force-dynamic";
 function parseWindowDays(value: string | null): number {
   const n = Number(value);
   if (!Number.isFinite(n)) return 30;
+  return Math.min(365, Math.max(7, Math.trunc(n)));
+}
+
+function parseLookbackDays(value: string | null): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 90;
   return Math.min(365, Math.max(7, Math.trunc(n)));
 }
 
@@ -57,6 +64,21 @@ export async function GET(req: Request) {
         { success: false, error: "Missing required query parameter: dealerId" },
         { status: 400 },
       );
+    }
+
+    if (isTruthyFlag(searchParams.get("analytics"))) {
+      const windowDays = parseWindowDays(searchParams.get("windowDays"));
+      const lookbackDays = parseLookbackDays(searchParams.get("lookbackDays"));
+      const bypassCache = isTruthyFlag(searchParams.get("refresh"));
+      const analytics = await fetchInventoryAnalytics(dealerId, {
+        windowDays,
+        lookbackDays,
+        bypassCache,
+      });
+      // An offline dealer's demand index still rides inside the schema payload
+      // (with `success: false` plus `error`) so the client can render
+      // zero-stock states; analytics never 404s.
+      return NextResponse.json(analytics, { status: 200 });
     }
 
     if (isTruthyFlag(searchParams.get("meta"))) {

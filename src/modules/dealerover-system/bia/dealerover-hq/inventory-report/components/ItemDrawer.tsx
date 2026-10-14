@@ -8,10 +8,9 @@ import { StatusBadge } from "@/components/ui/status-badge";
 import { cn } from "@/lib/utils";
 import { formatCurrency, formatDateTime, formatNumber } from "@/lib/utils";
 import type { InventoryRow } from "../types";
-import { computeSeverity, daysOfCover, inventoryValue } from "../utils/low-stock";
+import { computeSeverity, daysOfCover, daysSince, inventoryValue } from "../utils/low-stock";
 import type { ProductAggregate } from "../utils/aggregate";
 import { STATE_LABEL, STRIP_BG, TONE_BY_STATE } from "../utils/severity-tone";
-import { ThresholdCell } from "./ThresholdCell";
 
 export interface ItemDrawerSelection {
   dealerId: string;
@@ -24,9 +23,10 @@ interface ItemDrawerProps {
   branchRows: InventoryRow[];
   network: ProductAggregate[];
   windowDays: number;
+  lookbackDays: number;
   leadDays: number;
-  onCommit: (key: string, pieces: number) => void;
-  onReset: (key: string) => void;
+  dealerActive: boolean;
+  analyticsAvailable: boolean;
   onClose: () => void;
   onSelect: (dealerId: string, productId: number) => void;
 }
@@ -46,11 +46,26 @@ function displayUnitsText(pieces: number, unitCount: number, unitName?: string):
   return `${label} ${unit} (${formatNumber(pieces, "en-PH", 0)} pcs)`;
 }
 
-function formatCutoff(value: string): string {
-  if (!value) return "—";
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return value;
-  return formatDateTime(d);
+function formatDaily(demandWindow: number, windowDays: number): string {
+  if (!Number.isFinite(demandWindow) || windowDays <= 0) return "—";
+  const daily = Math.max(0, demandWindow) / windowDays;
+  const rounded = Math.round(daily * 10) / 10;
+  return `${Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)}/day`;
+}
+
+function formatCover(daysOfCover: number | null): string {
+  if (daysOfCover === null) return "—";
+  const rounded = Math.round(daysOfCover * 10) / 10;
+  return `${Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)} days`;
+}
+
+function formatLastSale(lastSaleAt: string): string {
+  if (!lastSaleAt) return "Never sold";
+  const d = new Date(lastSaleAt);
+  if (Number.isNaN(d.getTime())) return lastSaleAt;
+  const ago = daysSince(lastSaleAt);
+  const date = formatDateTime(d);
+  return ago === null ? date : `${date} · ${ago}d ago`;
 }
 
 export function ItemDrawer({
@@ -59,9 +74,10 @@ export function ItemDrawer({
   branchRows,
   network,
   windowDays,
+  lookbackDays,
   leadDays,
-  onCommit,
-  onReset,
+  dealerActive,
+  analyticsAvailable,
   onClose,
   onSelect,
 }: ItemDrawerProps) {
@@ -73,7 +89,6 @@ export function ItemDrawer({
 
   const open = selection !== null && aggregate !== null;
   const firstRow = branchRows[0];
-  const overrideKey = aggregate ? `${aggregate.dealerId}:${aggregate.productId}` : "";
 
   const branchView = React.useMemo(
     () =>
@@ -81,53 +96,29 @@ export function ItemDrawer({
         const doc = daysOfCover(row.onHand, row.demandQty, windowDays);
         const severity = computeSeverity({
           onHand: row.onHand,
-          demandQty: row.demandQty,
+          demandWindow: row.demandQty,
+          demandLookback: aggregate?.demandLookback ?? 0,
+          lastSaleAt: aggregate?.lastSaleAt ?? "",
           windowDays,
-          movementAfter: row.movementAfter,
-          effectiveMin: 0,
-          unitCount: row.unitCount,
           leadDays,
-          peerMedian: null,
-          unitName: row.unitName,
+          lookbackDays,
+          dealerActive,
+          analyticsAvailable,
+          unitCount: row.unitCount,
         });
         return { row, doc, severity };
       }),
-    [branchRows, leadDays, windowDays],
+    [branchRows, aggregate, dealerActive, analyticsAvailable, leadDays, lookbackDays, windowDays],
   );
 
   const meter = React.useMemo(() => {
-    if (!aggregate) return null;
-    if (aggregate.effectiveMin > 0) {
-      return {
-        pct: Math.min(100, Math.max(0, (aggregate.onHand / aggregate.effectiveMin) * 100)),
-        caption: `${displayUnitsText(aggregate.onHand, aggregate.unitCount, aggregate.unitName)} on hand vs ${displayUnitsText(aggregate.effectiveMin, aggregate.unitCount, aggregate.unitName)} minimum`,
-      };
-    }
-    if (aggregate.daysOfCover !== null && leadDays > 0) {
-      const rounded = Math.round(aggregate.daysOfCover * 10) / 10;
-      return {
-        pct: Math.min(100, Math.max(0, (aggregate.daysOfCover / leadDays) * 100)),
-        caption: `${Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)} days of cover vs ${leadDays}-day lead time`,
-      };
-    }
-    return null;
-  }, [aggregate, leadDays]);
-
-  const ruleLine = React.useMemo(() => {
-    if (!aggregate) return "";
-    const parts = [`${aggregate.reason}`];
-    if (aggregate.daysOfCover !== null) {
-      const rounded = Math.round(aggregate.daysOfCover * 10) / 10;
-      parts.push(`cover ${Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)}d vs ${leadDays}d lead`);
-    }
-    if (aggregate.effectiveMin > 0) {
-      parts.push(`minimum ${displayUnitsText(aggregate.effectiveMin, aggregate.unitCount, aggregate.unitName)}`);
-    }
-    if (aggregate.demandQty > 0) {
-      parts.push(`demand ${formatNumber(aggregate.demandQty, "en-PH", 0)} pcs / ${windowDays}d`);
-    }
-    return parts.join(" · ");
-  }, [aggregate, leadDays, windowDays]);
+    if (!aggregate || aggregate.daysOfCover === null) return null;
+    const rounded = Math.round(aggregate.daysOfCover * 10) / 10;
+    return {
+      pct: Math.min(100, Math.max(0, (aggregate.daysOfCover / 60) * 100)),
+      caption: `${Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)} days of cover at ${formatDaily(aggregate.demandQty, windowDays)} demand`,
+    };
+  }, [aggregate, windowDays]);
 
   return (
     <Sheet open={open} onOpenChange={(next) => { if (!next) onClose(); }}>
@@ -151,7 +142,7 @@ export function ItemDrawer({
             </div>
 
             <p className="px-4 text-xs text-muted-foreground">
-              Fired rule ({aggregate.reasonSource}): {ruleLine}
+              {aggregate.reason} · {formatNumber(aggregate.demandQty, "en-PH", 0)} pcs sold in {windowDays}d
             </p>
 
             {meter && (
@@ -162,6 +153,22 @@ export function ItemDrawer({
                 <p className="text-[11px] tabular-nums text-muted-foreground">{meter.caption}</p>
               </div>
             )}
+
+            <div className="space-y-1.5 px-4">
+              <p className="text-xs font-semibold">Demand analytics</p>
+              <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
+                <div><dt className="text-muted-foreground">On hand</dt><dd className="font-medium tabular-nums">{displayUnitsText(aggregate.onHand, aggregate.unitCount, aggregate.unitName)}</dd></div>
+                <div><dt className="text-muted-foreground">Demand / day</dt><dd className="font-medium tabular-nums">{formatDaily(aggregate.demandQty, windowDays)}</dd></div>
+                <div><dt className="text-muted-foreground">Days of cover</dt><dd className="font-medium tabular-nums">{formatCover(aggregate.daysOfCover)}</dd></div>
+                <div><dt className="text-muted-foreground">Sales in window ({windowDays}d)</dt><dd className="font-medium tabular-nums">{formatNumber(aggregate.demandQty, "en-PH", 0)} pcs</dd></div>
+                <div><dt className="text-muted-foreground">Sales in lookback ({lookbackDays}d)</dt><dd className="font-medium tabular-nums">{formatNumber(aggregate.demandLookback, "en-PH", 0)} pcs</dd></div>
+                <div><dt className="text-muted-foreground">Last sale</dt><dd className="font-medium">{formatLastSale(aggregate.lastSaleAt)}</dd></div>
+              </dl>
+              <p className="text-[11px] text-muted-foreground">
+                On hand {displayUnitsText(aggregate.onHand, aggregate.unitCount, aggregate.unitName)} across {aggregate.branchCount}{" "}
+                {aggregate.branchCount === 1 ? "branch" : "branches"}.
+              </p>
+            </div>
 
             <dl className="grid grid-cols-2 gap-x-4 gap-y-2 px-4 text-xs">
               <div><dt className="text-muted-foreground">Barcode</dt><dd className="truncate font-medium tabular-nums">{firstRow?.productBarcode || "—"}</dd></div>
@@ -174,23 +181,6 @@ export function ItemDrawer({
               <div><dt className="text-muted-foreground">Total value</dt><dd className="font-medium tabular-nums">{formatCurrency(aggregate.value)}</dd></div>
             </dl>
 
-            <div className="space-y-1 px-4">
-              <p className="text-xs font-semibold">Reorder minimum</p>
-              <ThresholdCell
-                overrideKey={overrideKey}
-                minPieces={aggregate.effectiveMin}
-                source={aggregate.minSource}
-                unitCount={aggregate.unitCount}
-                unitName={aggregate.unitName}
-                onCommit={onCommit}
-                onReset={onReset}
-              />
-              <p className="text-[11px] text-muted-foreground">
-                On hand {displayUnitsText(aggregate.onHand, aggregate.unitCount, aggregate.unitName)} across {aggregate.branchCount}{" "}
-                {aggregate.branchCount === 1 ? "branch" : "branches"}.
-              </p>
-            </div>
-
             <div className="space-y-1.5 px-4">
               <p className="text-xs font-semibold">Per-branch stock</p>
               <div className="overflow-x-auto rounded-lg border">
@@ -199,11 +189,10 @@ export function ItemDrawer({
                     <tr className="bg-muted/60 text-left">
                       <th className="px-2 py-1.5 font-medium">Branch</th>
                       <th className="px-2 py-1.5 text-right font-medium">On hand</th>
-                      <th className="px-2 py-1.5 text-right font-medium">Moved</th>
+                      <th className="px-2 py-1.5 text-right font-medium">Sales ({windowDays}d)</th>
                       <th className="px-2 py-1.5 text-right font-medium">DoC</th>
                       <th className="px-2 py-1.5 font-medium">State</th>
                       <th className="px-2 py-1.5 text-right font-medium">Value</th>
-                      <th className="px-2 py-1.5 font-medium">Last count</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -221,16 +210,13 @@ export function ItemDrawer({
                             {row.unitCount > 0 ? `${(Math.round((row.onHand / row.unitCount) * 10) / 10).toFixed(1)} ${resolveUnit(row.unitName, row.unitCount)}` : ""}
                           </span>
                         </td>
-                        <td className="px-2 py-1.5 text-right tabular-nums">{formatNumber(row.movementAfter, "en-PH", 0)}</td>
+                        <td className="px-2 py-1.5 text-right tabular-nums">{formatNumber(row.demandQty, "en-PH", 0)}</td>
                         <td className="px-2 py-1.5 text-right tabular-nums">{doc === null ? "—" : `${Math.round(doc * 10) / 10}d`}</td>
                         <td className="px-2 py-1.5">
                           <StatusBadge tone={TONE_BY_STATE[severity.state]}>{STATE_LABEL[severity.state]}</StatusBadge>
                         </td>
                         <td className="px-2 py-1.5 text-right tabular-nums">
                           {formatCurrency(inventoryValue(row.onHand, row.unitCount, row.costPerUnit))}
-                        </td>
-                        <td className="px-2 py-1.5 text-muted-foreground">
-                          {formatNumber(row.lastCount, "en-PH", 0)} · {formatCutoff(row.lastCutoff)}
                         </td>
                       </tr>
                     ))}

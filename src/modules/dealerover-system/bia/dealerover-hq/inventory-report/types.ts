@@ -50,21 +50,6 @@ export const InventoryRowSchema = z.object({
 
 export type InventoryRow = z.infer<typeof InventoryRowSchema>;
 
-export const StockOutItemSchema = z.object({
-  key: z.string(),
-  dealerId: z.string(),
-  dealerName: z.string(),
-  productId: z.number(),
-  productCode: z.string(),
-  productName: z.string(),
-  brand: z.string(),
-  category: z.string(),
-  costPerUnit: z.number(),
-  branchCount: z.number(),
-});
-
-export type StockOutItem = z.infer<typeof StockOutItemSchema>;
-
 export const DealerRosterEntrySchema = z.object({
   dealerId: z.string(),
   dealerName: z.string(),

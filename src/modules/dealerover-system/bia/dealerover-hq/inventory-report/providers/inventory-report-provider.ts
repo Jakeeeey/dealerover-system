@@ -1,9 +1,11 @@
 import { z } from "zod";
 import {
   DealerRosterEntrySchema,
+  InventoryAnalyticsResponseSchema,
   InventoryMetaResponseSchema,
   InventoryPageResponseSchema,
   type DealerRosterEntry,
+  type InventoryAnalyticsResponse,
   type InventoryMetaResponse,
   type InventoryPageResponse,
 } from "../types";
@@ -15,6 +17,9 @@ const API_PATH = "/api/dealerover-system/bia/dealerover-hq/inventory-report";
  * `meta.branchPageSize` when a meta payload is in hand.
  */
 export const BRANCH_PAGE_SIZE = 10;
+
+/** Client-side default for the not-selling lookback horizon (days). */
+export const LOOKBACK_DAYS = 90;
 
 const RosterResponseSchema = z.object({
   success: z.boolean(),
@@ -127,4 +132,44 @@ export async function getInventoryPage(
   }
 
   return InventoryPageResponseSchema.parse(payload);
+}
+
+export interface InventoryAnalyticsQuery {
+  windowDays: number;
+  lookbackDays: number;
+  refresh?: boolean;
+  signal?: AbortSignal;
+}
+
+/**
+ * Loads one dealer's per-product demand index covering the whole invoiced
+ * catalogue (not just products that still hold stock). An offline dealer
+ * rides inside its schema payload (`success: false` plus `error`) and does
+ * not throw; transport-level failures throw.
+ */
+export async function getInventoryAnalytics(
+  dealerId: string,
+  query: InventoryAnalyticsQuery,
+): Promise<InventoryAnalyticsResponse> {
+  const params = new URLSearchParams();
+  params.set("dealerId", dealerId);
+  params.set("analytics", "1");
+  params.set("windowDays", String(query.windowDays));
+  params.set("lookbackDays", String(query.lookbackDays));
+  if (query.refresh === true) params.set("refresh", "1");
+
+  const res = await fetch(`${API_PATH}?${params.toString()}`, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+    cache: "no-store",
+    signal: query.signal,
+  });
+
+  const payload = await readPayload(res);
+
+  if (!res.ok) {
+    throw new Error(errorMessage(payload, "Failed to load inventory analytics"));
+  }
+
+  return InventoryAnalyticsResponseSchema.parse(payload);
 }

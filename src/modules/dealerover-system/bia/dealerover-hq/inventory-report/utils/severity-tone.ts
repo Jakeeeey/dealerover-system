@@ -9,6 +9,8 @@ export const TONE_BY_STATE: Record<LowStockState, StatusTone> = {
   healthy: "success",
   overstock: "neutral",
   dead: "neutral",
+  dropped: "neutral",
+  unrated: "neutral",
 };
 
 export const STATE_LABEL: Record<LowStockState, string> = {
@@ -18,7 +20,9 @@ export const STATE_LABEL: Record<LowStockState, string> = {
   watch: "Watch",
   healthy: "Healthy",
   overstock: "Overstock",
-  dead: "Dead",
+  dead: "Dead stock",
+  dropped: "Dropped",
+  unrated: "Unrated",
 };
 
 /**
@@ -37,6 +41,8 @@ export const CELL_WASH: Record<LowStockState, string> = {
   healthy: "bg-success-bg text-foreground",
   overstock: "bg-muted text-muted-foreground",
   dead: "bg-muted text-muted-foreground",
+  dropped: "bg-muted text-muted-foreground",
+  unrated: "bg-muted text-muted-foreground",
 };
 
 export const STRIP_BG: Record<LowStockState, string> = {
@@ -47,4 +53,6 @@ export const STRIP_BG: Record<LowStockState, string> = {
   healthy: "bg-success",
   overstock: "bg-muted-foreground",
   dead: "bg-muted-foreground",
+  dropped: "bg-muted-foreground",
+  unrated: "bg-muted-foreground",
 };

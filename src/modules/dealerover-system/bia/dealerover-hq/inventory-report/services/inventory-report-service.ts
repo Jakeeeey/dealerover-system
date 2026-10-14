@@ -3,10 +3,12 @@ import type {
   BranchKind,
   DealerBranch,
   DealerRosterEntry,
+  InventoryAnalyticsResponse,
   InventoryMetaResponse,
   InventoryPageResponse,
   InventoryRow,
   MasterProduct,
+  ProductDemand,
 } from "../types";
 
 /**
@@ -100,7 +102,6 @@ const PRODUCT_FIELDS = [
   "product_name",
   "cost_per_unit",
   "price_per_unit",
-  "maintaining_quantity",
   "unit_of_measurement",
   "unit_of_measurement_count",
   "product_brand",
@@ -167,7 +168,6 @@ interface RawProduct {
   product_code?: string | null;
   product_name?: string | null;
   cost_per_unit?: number | string | null;
-  maintaining_quantity?: number | string | null;
   unit_of_measurement_count?: number | string | null;
   product_brand?: number | string | null;
   product_category?: number | string | null;
@@ -245,6 +245,11 @@ function extractData<T>(payload: unknown): T[] {
 
 function normalizeWindowDays(value: unknown): number {
   return Math.min(365, Math.max(7, Math.trunc(toNum(value)) || 30));
+}
+
+/** Clamps the not-selling lookback horizon (client default 90 days). */
+function normalizeLookbackDays(value: unknown): number {
+  return Math.min(365, Math.max(7, Math.trunc(toNum(value)) || 90));
 }
 
 function normalizePageSize(value: unknown): number {
@@ -531,21 +536,25 @@ function buildDemandByKey(
   packById: Map<number, number>,
   windowStart: number,
 ): Map<string, number> {
-  const branchByInvoice = new Map<string, number>();
+  // `sales_invoice_details.invoice_no` is an INTEGER foreign key to
+  // `sales_invoice.invoice_id` — it is NOT the invoice's own invoice_no, which
+  // is a business code like "Dealer-THJ2MIY3". Keying by the code matched
+  // nothing and silently zeroed every demand figure.
+  const branchByInvoice = new Map<number, number>();
   for (const inv of invoices) {
-    const invoiceNo = str(inv.invoice_no);
-    if (!invoiceNo) continue;
+    const invoiceId = toInt(inv.invoice_id);
+    if (invoiceId <= 0) continue;
     if (EXCLUDED_INVOICE_STATUSES.has(str(inv.transaction_status).toLowerCase())) continue;
     const date = Date.parse(str(inv.invoice_date));
     if (!Number.isFinite(date) || date < windowStart) continue;
     const branchId = toInt(inv.branch_id);
     if (branchId <= 0) continue;
-    branchByInvoice.set(invoiceNo, branchId);
+    branchByInvoice.set(invoiceId, branchId);
   }
 
   const demandByKey = new Map<string, number>();
   for (const line of details) {
-    const branchId = branchByInvoice.get(str(line.invoice_no));
+    const branchId = branchByInvoice.get(toInt(line.invoice_no));
     if (!branchId) continue;
     const productId = toInt(line.product_id);
     if (productId <= 0) continue;
@@ -592,7 +601,6 @@ async function fetchMasterProducts(
         category: categoryById.get(toInt(p.product_category)) ?? "",
         unitCount: toNum(p.unit_of_measurement_count),
         costPerUnit: toNum(p.cost_per_unit),
-        maintainingQuantity: toNum(p.maintaining_quantity),
       });
     }
     if (batch.length < MASTER_PAGE_LIMIT) break;
@@ -966,7 +974,6 @@ export async function fetchInventoryPage(
       movementAfter: toNum(raw.movementAfter),
       lastCutoff: str(raw.lastCutoff),
       costPerUnit: master?.costPerUnit ?? 0,
-      maintainingQuantity: master?.maintainingQuantity ?? 0,
       demandQty: demandByKey.get(`${productId}:${branchId}`) ?? 0,
     });
   }
@@ -984,6 +991,177 @@ export async function fetchInventoryPage(
   };
   if (!opts?.bypassCache) {
     dealeroverCache.set(cacheKey, response, PAGE_CACHE_TTL_MS);
+  }
+  return response;
+}
+
+/**
+ * Builds the per-product demand index for one dealer: for EVERY product that
+ * appears in the dealer's invoice history, pieces sold inside the demand
+ * window and inside the longer not-selling lookback, plus the product's most
+ * recent sale date. Line quantities are in selling units, so pieces =
+ * quantity x the product's pack size (`unit_of_measurement_count`), exactly
+ * as the page demand join does. Invoices with a cancellation-like status or
+ * an unparsable date are excluded. A failing dealer is reported offline
+ * (with `success: false` plus `error`) instead of throwing.
+ */
+export async function fetchInventoryAnalytics(
+  dealerId: string,
+  opts?: { windowDays?: number; lookbackDays?: number; bypassCache?: boolean },
+): Promise<InventoryAnalyticsResponse> {
+  const id = str(dealerId);
+  const windowDays = normalizeWindowDays(opts?.windowDays ?? 30);
+  const lookbackDays = normalizeLookbackDays(opts?.lookbackDays ?? 90);
+
+  const offline = (error: string): InventoryAnalyticsResponse => ({
+    success: false,
+    dealerId: id,
+    windowDays,
+    lookbackDays,
+    lastInvoiceAt: "",
+    products: [],
+    error,
+  });
+
+  const cacheKey = `inventory-report:analytics:${id}:${windowDays}:${lookbackDays}`;
+  if (!opts?.bypassCache) {
+    const hit = dealeroverCache.get<InventoryAnalyticsResponse>(cacheKey);
+    if (hit) return hit;
+  }
+
+  if (!UPSTREAM) {
+    console.error("ERR_CONFIG: [InventoryReport] NEXT_PUBLIC_API_BASE_URL is not defined");
+    return offline("Server configuration error");
+  }
+
+  let roster: DealerRow[];
+  try {
+    roster = await getCachedDealerList();
+  } catch (error) {
+    console.error("ERR_API_FAIL: [InventoryReport] Failed to load dealer roster:", error);
+    return offline("Unable to reach the dealer registry");
+  }
+
+  const dealer = findDealer(roster, id);
+  if (!dealer) {
+    console.error(`ERR_NOT_FOUND: [InventoryReport] Dealer "${id}" is not on the roster`);
+    return offline("Unknown dealer");
+  }
+
+  const dealerName = str(dealer.dealer_name) || `Dealer ${id}`;
+  const directusBase = str(dealer.directus).replace(/\/+$/, "");
+  if (!directusBase) {
+    return offline(DEALER_FAILURE_MESSAGES["unreachable"]);
+  }
+
+  let ctx: DealerContext;
+  try {
+    ctx = await ensureDealerContext(dealer);
+  } catch (err) {
+    console.error(`ERR_API_FAIL: [InventoryReport] Dealer "${dealerName}" master unreachable:`, err);
+    return offline(DEALER_FAILURE_MESSAGES["product-master-unreachable"]);
+  }
+
+  const headers = dealerHeaders(dealer);
+  let invoices: RawInvoice[];
+  let invoiceLines: RawInvoiceDetail[];
+  try {
+    const settled = await Promise.all([
+      getCachedCollection<RawInvoice>(
+        `inventory-report:${id}:invoices`,
+        `${directusBase}/items/sales_invoice?limit=-1&fields=${SALES_INVOICE_FIELDS}`,
+        headers,
+      ),
+      getCachedCollection<RawInvoiceDetail>(
+        `inventory-report:${id}:invoice-lines`,
+        `${directusBase}/items/sales_invoice_details?limit=-1&fields=${SALES_DETAIL_FIELDS}`,
+        headers,
+      ),
+    ]);
+    invoices = settled[0];
+    invoiceLines = settled[1];
+  } catch (err) {
+    console.error(`ERR_API_FAIL: [InventoryReport] Dealer "${dealerName}" invoices unreachable:`, err);
+    const failure = classifyStockError(err);
+    return offline(
+      failure === "timeout" ? DEALER_FAILURE_MESSAGES["timeout"] : "Dealer invoice history unreachable",
+    );
+  }
+
+  const packById = new Map<number, number>();
+  for (const p of ctx.products) {
+    if (p.unitCount > 0) packById.set(p.productId, p.unitCount);
+  }
+
+  const now = Date.now();
+  const dayMs = 24 * 60 * 60 * 1000;
+  const windowStart = now - Math.max(windowDays, 1) * dayMs;
+  const lookbackStart = now - Math.max(lookbackDays, 1) * dayMs;
+
+  // Keyed by the invoice's numeric PK: `sales_invoice_details.invoice_no` is a
+  // foreign key to `sales_invoice.invoice_id`, not to the invoice's own
+  // invoice_no code (see buildDemandByKey).
+  const dateByInvoice = new Map<number, { at: number; raw: string }>();
+  let lastInvoiceAt = "";
+  let lastInvoiceTime = Number.NEGATIVE_INFINITY;
+  for (const inv of invoices) {
+    const invoiceId = toInt(inv.invoice_id);
+    if (invoiceId <= 0) continue;
+    if (EXCLUDED_INVOICE_STATUSES.has(str(inv.transaction_status).toLowerCase())) continue;
+    const rawDate = str(inv.invoice_date);
+    const at = Date.parse(rawDate);
+    if (!Number.isFinite(at)) continue;
+    if (!dateByInvoice.has(invoiceId) || at > (dateByInvoice.get(invoiceId)?.at ?? 0)) {
+      dateByInvoice.set(invoiceId, { at, raw: rawDate });
+    }
+    if (at > lastInvoiceTime) {
+      lastInvoiceTime = at;
+      lastInvoiceAt = rawDate;
+    }
+  }
+
+  const windowByProduct = new Map<number, number>();
+  const lookbackByProduct = new Map<number, number>();
+  const lastSaleByProduct = new Map<number, { at: number; raw: string }>();
+  const seenProducts = new Set<number>();
+  for (const line of invoiceLines) {
+    const sale = dateByInvoice.get(toInt(line.invoice_no));
+    if (!sale) continue;
+    const productId = toInt(line.product_id);
+    if (productId <= 0) continue;
+    seenProducts.add(productId);
+    const qty = toNum(line.quantity);
+    if (qty === 0) continue;
+    const pieces = qty * (packById.get(productId) ?? 1);
+    if (sale.at >= lookbackStart) {
+      lookbackByProduct.set(productId, (lookbackByProduct.get(productId) ?? 0) + pieces);
+    }
+    if (sale.at >= windowStart) {
+      windowByProduct.set(productId, (windowByProduct.get(productId) ?? 0) + pieces);
+    }
+    const prev = lastSaleByProduct.get(productId);
+    if (!prev || sale.at > prev.at) lastSaleByProduct.set(productId, sale);
+  }
+
+  const products: ProductDemand[] = [...seenProducts]
+    .sort((a, b) => a - b)
+    .map((productId) => ({
+      productId,
+      demandWindow: windowByProduct.get(productId) ?? 0,
+      demandLookback: lookbackByProduct.get(productId) ?? 0,
+      lastSaleAt: lastSaleByProduct.get(productId)?.raw ?? "",
+    }));
+
+  const response: InventoryAnalyticsResponse = {
+    success: true,
+    dealerId: id,
+    windowDays,
+    lookbackDays,
+    lastInvoiceAt,
+    products,
+  };
+  if (!opts?.bypassCache) {
+    dealeroverCache.set(cacheKey, response, CACHE_TTL_MS);
   }
   return response;
 }

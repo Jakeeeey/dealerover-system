@@ -2,38 +2,23 @@
 
 import { StatusBadge } from "@/components/ui/status-badge";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { cn, formatCurrency, formatNumber } from "@/lib/utils";
+import { formatCurrency } from "@/lib/utils";
 
 interface HeroBandProps {
   dealerName: string;
   dealerCode: string;
   online: boolean;
-  skusTracked: number;
-  outCount: number;
-  criticalCount: number;
-  lowCount: number;
   totalValue: number;
 }
 
 const VALUE_FORMULA = "Value = (pieces ÷ pieces-per-display-unit) × cost-per-display-unit, summed over every branch row.";
 
-const MICRO_LABEL = "text-[11px] font-medium uppercase tracking-wider text-muted-foreground";
-
 /**
- * Single-dealer hero band — carries the scoped dealer's identity (name, code,
- * online state) plus that dealer's headline counts. Visible in both the
- * dashboard and the drill-table views.
+ * Single-dealer hero band — the page anchor. Identity on the left, dealer
+ * status plus the dealer's total inventory value on the right. Exception
+ * counts live in layer 1, not here.
  */
-export function HeroBand({
-  dealerName,
-  dealerCode,
-  online,
-  skusTracked,
-  outCount,
-  criticalCount,
-  lowCount,
-  totalValue,
-}: HeroBandProps) {
+export function HeroBand({ dealerName, dealerCode, online, totalValue }: HeroBandProps) {
   return (
     <section
       aria-label="Inventory overview"
@@ -46,18 +31,17 @@ export function HeroBand({
           <h2 className="truncate text-xl font-bold tracking-tight sm:text-2xl">Inventory Report</h2>
           <p className="truncate text-sm text-muted-foreground">
             {dealerName || "No dealer selected"}
-            {dealerCode ? ` · ${dealerCode}` : ""} — low-stock signals, demand cover, and value at risk.
+            {dealerCode ? ` · ${dealerCode}` : ""}
           </p>
         </div>
       </div>
 
-      <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:gap-6">
+      <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center sm:gap-6">
         <div className="min-w-0 sm:text-right">
-          <p className={MICRO_LABEL}>Dealer inventory value</p>
           <TooltipProvider>
             <Tooltip>
               <TooltipTrigger asChild>
-                <p className="truncate text-2xl font-black tracking-tight tabular-nums sm:text-3xl">
+                <p className="truncate text-2xl font-bold tracking-tight tabular-nums sm:text-3xl">
                   {formatCurrency(totalValue)}
                 </p>
               </TooltipTrigger>
@@ -66,40 +50,11 @@ export function HeroBand({
               </TooltipContent>
             </Tooltip>
           </TooltipProvider>
+          <p className="text-xs text-muted-foreground">Dealer inventory value</p>
         </div>
-
-        <div className="grid grid-cols-2 gap-x-5 gap-y-3 border-t pt-3 sm:border-l sm:border-t-0 sm:pl-6 sm:pt-0">
-          <div className="min-w-0">
-            <p className="flex items-center gap-1.5 text-sm font-semibold tabular-nums">
-              <span
-                aria-hidden
-                className={cn("size-2 shrink-0 animate-pulse rounded-full", online ? "bg-success" : "bg-warning")}
-              />
-              <StatusBadge tone={online ? "success" : "warning"}>{online ? "Online" : "Offline"}</StatusBadge>
-            </p>
-            <p className={MICRO_LABEL}>Dealer status</p>
-          </div>
-          <div className="min-w-0">
-            <p className="text-sm font-semibold tabular-nums text-destructive">
-              {formatNumber(outCount, "en-PH", 0)}
-            </p>
-            <p className={MICRO_LABEL}>Stock-outs</p>
-          </div>
-          <div className="min-w-0">
-            <p className="text-sm font-semibold tabular-nums">
-              {formatNumber(criticalCount + lowCount, "en-PH", 0)}
-              <span className="font-normal text-muted-foreground">
-                {" "}
-                · {formatNumber(criticalCount, "en-PH", 0)} critical
-              </span>
-            </p>
-            <p className={MICRO_LABEL}>Critical + low</p>
-          </div>
-          <div className="min-w-0">
-            <p className="text-sm font-semibold tabular-nums">{formatNumber(skusTracked, "en-PH", 0)}</p>
-            <p className={MICRO_LABEL}>SKUs tracked</p>
-          </div>
-        </div>
+        <StatusBadge tone={online ? "success" : "warning"} className="self-start sm:self-center">
+          {online ? "Online" : "Offline"}
+        </StatusBadge>
       </div>
     </section>
   );

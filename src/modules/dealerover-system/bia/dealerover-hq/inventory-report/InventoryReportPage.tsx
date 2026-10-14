@@ -12,11 +12,11 @@ import { triggerRankConfetti } from "@/modules/dealerover-system/bia/dealerover-
 import type { DrillTarget, InventoryRow } from "./types";
 import { useInventoryReport } from "./hooks/useInventoryReport";
 import { useLowStockPolicy } from "./hooks/useLowStockPolicy";
-import { buildProductAggregates, SEVERITY_RANK, type ProductAggregate } from "./utils/aggregate";
+import { buildProductAggregates, FLAGGED_STATES, SEVERITY_RANK, type ProductAggregate } from "./utils/aggregate";
 import { STATE_LABEL } from "./utils/severity-tone";
 import { HeroBand } from "./components/HeroBand";
 import { DealerSelect } from "./components/DealerSelect";
-import { DashboardCards } from "./components/DashboardCards";
+import { InventoryDashboard } from "./components/InventoryDashboard";
 import { LowStockBoard } from "./components/LowStockBoard";
 import { ItemDrawer, type ItemDrawerSelection } from "./components/ItemDrawer";
 import { PolicyPanel } from "./components/PolicyPanel";
@@ -70,19 +70,51 @@ function dimensionField(item: ProductAggregate, dimension: "brand" | "category" 
   return (raw ?? "").trim();
 }
 
+/**
+ * True when the dealer has at least one invoice inside the demand window.
+ * Without a recent invoice there is no demand signal, so cover-based
+ * states cannot be judged — the classifier falls back to stock-only
+ * states (dead / dropped / unrated).
+ */
+function isDemandActive(lastInvoiceAt: string, windowDays: number): boolean {
+  if (!lastInvoiceAt) return false;
+  const time = Date.parse(lastInvoiceAt);
+  if (!Number.isFinite(time)) return false;
+  return Date.now() - time <= Math.max(windowDays, 1) * 24 * 60 * 60 * 1000;
+}
+
 export default function InventoryReportPage() {
   const [filters, setFilters] = React.useState<FilterState>(DEFAULT_FILTERS);
   const [drill, setDrill] = React.useState<DrillTarget | null>(null);
   const [selection, setSelection] = React.useState<ItemDrawerSelection | null>(null);
   const policy = useLowStockPolicy();
 
-  // "" means "let the hook default to roster[0]".
+  // "" means "let the hook default to roster[0]"; lookbackDays is the analytics
+  // horizon the hook uses to build the per-product demand index.
   const query = React.useMemo(
-    () => ({ dealerId: filters.dealerId || null, includeZero: filters.includeZero, windowDays: filters.windowDays }),
-    [filters.dealerId, filters.includeZero, filters.windowDays],
+    () => ({
+      dealerId: filters.dealerId || null,
+      includeZero: filters.includeZero,
+      windowDays: filters.windowDays,
+      lookbackDays: policy.policy.lookbackDays,
+    }),
+    [filters.dealerId, filters.includeZero, filters.windowDays, policy.policy.lookbackDays],
   );
-  const { roster, dealer, branches, products, rows, stockOuts, progress, streaming, isLoading, error, refresh } =
-    useInventoryReport(query);
+  const {
+    roster,
+    dealer,
+    branches,
+    products,
+    rows,
+    analytics,
+    analyticsAvailable,
+    lastInvoiceAt,
+    progress,
+    streaming,
+    isLoading,
+    error,
+    refresh,
+  } = useInventoryReport(query);
 
   React.useEffect(() => {
     setFilters(readStoredFilters());
@@ -125,44 +157,62 @@ export default function InventoryReportPage() {
   }, []);
 
   const effectivePolicy = React.useMemo(
-    () => ({ ...policy.policy, windowDays: filters.windowDays }),
-    [policy.policy, filters.windowDays],
+    () => ({
+      leadDays: policy.policy.leadDays,
+      windowDays: filters.windowDays,
+      lookbackDays: policy.policy.lookbackDays,
+    }),
+    [policy.policy.leadDays, policy.policy.lookbackDays, filters.windowDays],
   );
+
+  const dealerActive = React.useMemo(
+    () => analyticsAvailable && isDemandActive(lastInvoiceAt, filters.windowDays),
+    [analyticsAvailable, lastInvoiceAt, filters.windowDays],
+  );
+
+  const dealerInfo = React.useMemo(() => {
+    if (dealer) {
+      return { dealerId: dealer.dealerId, dealerName: dealer.dealerName, dealerCode: dealer.dealerCode };
+    }
+    const fallback = roster?.find((r) => r.dealerId === activeDealerId);
+    if (fallback) {
+      return { dealerId: fallback.dealerId, dealerName: fallback.dealerName, dealerCode: fallback.dealerCode };
+    }
+    return undefined;
+  }, [dealer, roster, activeDealerId]);
 
   const aggregates = React.useMemo(
-    () => buildProductAggregates(rows ?? [], effectivePolicy),
-    [rows, effectivePolicy],
+    () =>
+      buildProductAggregates(
+        rows ?? [],
+        products ?? [],
+        analytics,
+        effectivePolicy,
+        dealerActive,
+        analyticsAvailable,
+        dealerInfo,
+      ),
+    [rows, products, analytics, effectivePolicy, dealerActive, analyticsAvailable, dealerInfo],
   );
 
-  const categories = React.useMemo(() => {
-    const set = new Set<string>();
-    for (const row of rows ?? []) {
-      if (row.productCategory.trim()) set.add(row.productCategory);
-    }
-    return Array.from(set).sort((a, b) => a.localeCompare(b));
-  }, [rows]);
-
-  const outCount = React.useMemo(
-    () => (stockOuts?.length ?? 0) + aggregates.filter((a) => a.state === "out").length,
-    [aggregates, stockOuts],
-  );
-  const criticalCount = React.useMemo(
-    () => aggregates.filter((a) => a.state === "critical").length,
+  // The master is fully classified, so the hero figure comes straight from
+  // the aggregates — exception counts live in layer 1, not the hero.
+  const flaggedCount = React.useMemo(
+    () => aggregates.filter((a) => FLAGGED_STATES.has(a.state)).length,
     [aggregates],
   );
-  const lowCount = React.useMemo(() => aggregates.filter((a) => a.state === "low").length, [aggregates]);
   const totalValue = React.useMemo(() => aggregates.reduce((sum, a) => sum + a.value, 0), [aggregates]);
 
   const drillView = React.useMemo(() => {
     if (!drill) return null;
     if (drill.kind === "urgent") {
       const items = aggregates
-        .filter((a) => a.state !== "healthy")
+        .filter((a) => FLAGGED_STATES.has(a.state))
         .sort((a, b) => SEVERITY_RANK[a.state] - SEVERITY_RANK[b.state] || b.value - a.value);
       return {
         title: `Most urgent at ${dealerName}`,
         summary: `Every flagged product at ${dealerName}, ranked by severity.`,
-        emptyHint: `Nothing is flagged at ${dealerName} — every product is healthy.`,
+        emptyHint: `Nothing is flagged at ${dealerName} — every product is healthy, unrated, or dropped.`,
         items,
       };
     }
@@ -185,13 +235,23 @@ export default function InventoryReportPage() {
       };
     }
     const scopedRows = (rows ?? []).filter((r) => r.branchId === drill.branchId);
+    const scopedIds = new Set(scopedRows.map((r) => r.productId));
+    const scopedMaster = (products ?? []).filter((p) => scopedIds.has(p.productId));
     return {
       title: drill.label,
       summary: `Every product stocked at ${drill.label} (${dealerName}), ranked by severity.`,
       emptyHint: `No products stocked at ${drill.label} right now.`,
-      items: buildProductAggregates(scopedRows, effectivePolicy),
+      items: buildProductAggregates(
+        scopedRows,
+        scopedMaster,
+        analytics,
+        effectivePolicy,
+        dealerActive,
+        analyticsAvailable,
+        dealerInfo,
+      ),
     };
-  }, [drill, aggregates, rows, effectivePolicy, dealerName]);
+  }, [drill, aggregates, rows, products, analytics, effectivePolicy, dealerActive, analyticsAvailable, dealerInfo, dealerName]);
 
   const drillKey = drill
     ? drill.kind === "severity"
@@ -229,8 +289,10 @@ export default function InventoryReportPage() {
   // it from progress left the "Streaming" strip up forever after a failure.
 
   const celebratedRef = React.useRef(false);
+  // A dormant dealer never celebrates: with no demand signal the board is
+  // unrated, not healthy.
   const allClear =
-    !isLoading && !streaming && (rows?.length ?? 0) > 0 && outCount === 0 && criticalCount + lowCount === 0;
+    !isLoading && !streaming && aggregates.length > 0 && flaggedCount === 0 && dealerActive;
   React.useEffect(() => {
     celebratedRef.current = false;
   }, [activeDealerId]);
@@ -268,17 +330,13 @@ export default function InventoryReportPage() {
         dealerName={dealer?.dealerName ?? ""}
         dealerCode={dealer?.dealerCode ?? ""}
         online={!offline}
-        skusTracked={aggregates.length + (stockOuts?.length ?? 0)}
-        outCount={outCount}
-        criticalCount={criticalCount}
-        lowCount={lowCount}
         totalValue={totalValue}
       />
 
-      {/* Toolbar — three groups so the row reads as scope | basis | action:
-          every control keeps its own group when the row wraps. Anything that is
-          a STATUS (streaming, offline) lives in its own strip below, so a state
-          never gets mistaken for a control. */}
+      {/* Toolbar — scope | analytics | action: every control keeps its own
+          group when the row wraps. Anything that is a STATUS (streaming,
+          offline) lives in its own strip below, so a state never gets
+          mistaken for a control. */}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <div className="flex flex-wrap items-center gap-2">
           <div className="w-44 sm:w-56">
@@ -301,29 +359,12 @@ export default function InventoryReportPage() {
 
         <span className="h-5 w-px shrink-0 bg-border" aria-hidden />
 
-        <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Minimum basis">
-          <div className="flex items-center gap-0.5 rounded-lg border border-border p-0.5">
-            {(["policy", "maintain"] as const).map((basis) => (
-              <Button
-                key={basis}
-                variant={policy.policy.basis === basis ? "default" : "ghost"}
-                size="sm"
-                className={cn("h-7 px-2.5 text-xs min-h-11 md:min-h-0", policy.policy.basis !== basis && "text-muted-foreground")}
-                onClick={() => policy.setBasis(basis)}
-                aria-pressed={policy.policy.basis === basis}
-              >
-                {basis === "policy" ? "Threshold" : "Maintain"}
-              </Button>
-            ))}
-          </div>
+        <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Demand analytics">
           <PolicyPanel
             policy={effectivePolicy}
-            categories={categories}
-            onBasis={policy.setBasis}
             onLeadDays={policy.setLeadDays}
             onWindowDays={(days) => persistFilters({ ...filters, windowDays: Math.min(365, Math.max(7, Math.trunc(days) || 30)) })}
-            onDefaultMinCases={policy.setDefaultMinCases}
-            onCategoryMin={policy.setCategoryMin}
+            onLookbackDays={policy.setLookbackDays}
           />
         </div>
 
@@ -377,6 +418,25 @@ export default function InventoryReportPage() {
         </p>
       )}
 
+      {dealer && !analyticsAvailable && (
+        <p className="flex flex-wrap items-center gap-2 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-foreground" role="alert">
+          <StatusBadge tone="warning">Demand data unavailable</StatusBadge>
+          <span>
+            The sales index for this dealer did not load, so products cannot be graded. Look for
+            ERR_ANALYTICS_FAIL in the server log, then refresh.
+          </span>
+        </p>
+      )}
+
+      {dealer && analyticsAvailable && !dealerActive && (
+        <p className="flex flex-wrap items-center gap-2 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-foreground" role="status">
+          <StatusBadge tone="warning">Stale demand</StatusBadge>
+          <span>
+            No sales in the last {filters.windowDays} days — demand signals unavailable, showing stock-only classification.
+          </span>
+        </p>
+      )}
+
       {drill && drillView ? (
         <section aria-label="Drill-down table" className="space-y-3">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
@@ -412,11 +472,14 @@ export default function InventoryReportPage() {
           />
         </section>
       ) : (
-        <DashboardCards
+        <InventoryDashboard
           aggregates={aggregates}
           rows={rows ?? []}
           branches={branches ?? []}
           products={products ?? []}
+          analytics={analytics}
+          dealerActive={dealerActive}
+          analyticsAvailable={analyticsAvailable}
           policy={effectivePolicy}
           progress={{
             pagesDone: progress?.pagesDone ?? 0,
@@ -435,9 +498,10 @@ export default function InventoryReportPage() {
         branchRows={drawerBranchRows}
         network={drawerNetwork}
         windowDays={filters.windowDays}
-        leadDays={policy.policy.leadDays}
-        onCommit={policy.setOverride}
-        onReset={policy.resetOverride}
+        lookbackDays={effectivePolicy.lookbackDays}
+        leadDays={effectivePolicy.leadDays}
+        dealerActive={dealerActive}
+        analyticsAvailable={analyticsAvailable}
         onClose={() => setSelection(null)}
         onSelect={handleSelect}
       />
