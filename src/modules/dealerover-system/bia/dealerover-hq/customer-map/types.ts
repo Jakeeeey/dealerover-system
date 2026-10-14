@@ -92,7 +92,7 @@ export const EMPTY_CUSTOMER_MAP_FILTERS: CustomerMapFilterState = {
 };
 
 /** How customer points are drawn on the map. */
-export type CustomerMapMarkerStyle = "dots" | "heatmap";
+export type CustomerMapMarkerStyle = "dots" | "heatmap" | "clusters";
 
 /** Basemap style (OpenFreeMap — keyless, no caps, commercial use allowed). */
 export type CustomerMapBasemap = "liberty" | "positron" | "dark" | "bright" | "fiord";

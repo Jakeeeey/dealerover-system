@@ -24,6 +24,14 @@ const SOURCE_ID = "customer-points";
 const HEAT_ID = "customer-heat";
 const CIRCLE_ID = "customer-points-circle";
 
+// Clustered copy of the same point set (a second source — never `cluster:true`
+// on the dots source, or dots mode would break). Fed the same FeatureCollection
+// whenever the filtered set changes.
+const CLUSTER_SOURCE_ID = "customer-points-cluster";
+const CLUSTER_CIRCLE_ID = "customer-cluster-circles";
+const CLUSTER_COUNT_ID = "customer-cluster-count";
+const CLUSTER_POINT_ID = "customer-cluster-points";
+
 // Boundary highlight (selected province/city/barangay): a dark dim mask with
 // the selection cut out as holes, an accent tint over the selection, and a
 // multi-pass neon glow border (blurred halo stack + bright white core).
@@ -113,6 +121,32 @@ interface CustomerFeatureProps {
   priceType: string;
   paymentTerm: string;
   isActive: number;
+}
+
+/** Map selection: one customer (detail card) or several stacked at one spot (list). */
+type CustomerSelection =
+  | { kind: "single"; customer: CustomerFeatureProps }
+  | { kind: "list"; customers: CustomerFeatureProps[] };
+
+/** Type guard for a rendered cluster feature (carries point_count/cluster_id). */
+function isClusterFeature(properties: Record<string, unknown>): boolean {
+  return properties.cluster_id !== undefined && properties.cluster_id !== null;
+}
+
+/** Dedupes rendered hits by `properties.key` — a feature can repeat across tiles. */
+function dedupeHits(hits: { properties?: Record<string, unknown> | null }[]): Record<string, unknown>[] {
+  const seen = new Set<string>();
+  const unique: Record<string, unknown>[] = [];
+  for (const hit of hits) {
+    const props = hit.properties;
+    if (!props) continue;
+    // Cluster aggregates carry no customer key — keep them (deduped by cluster_id).
+    const key = typeof props.key === "string" ? props.key : `cluster:${String(props.cluster_id)}`;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    unique.push(props);
+  }
+  return unique;
 }
 
 interface CustomerMapViewProps {
@@ -498,6 +532,9 @@ function applyBoundaryLayers(map: MapLibreMap, highlight: BoundaryHighlight | nu
     TINT_ID,
     HEAT_ID,
     CIRCLE_ID,
+    CLUSTER_CIRCLE_ID,
+    CLUSTER_COUNT_ID,
+    CLUSTER_POINT_ID,
     GLOW_FAR_ID,
     GLOW_NEAR_ID,
     LINE_ID,
@@ -601,7 +638,7 @@ export function CustomerMapView({
   const appliedBasemapRef = React.useRef<CustomerMapBasemap | null>(null);
   const initialBasemapRef = React.useRef(basemap);
   const [mapReady, setMapReady] = React.useState(false);
-  const [selected, setSelected] = React.useState<CustomerFeatureProps | null>(null);
+  const [selected, setSelected] = React.useState<CustomerSelection | null>(null);
   const [legendOpen, setLegendOpen] = React.useState(true);
 
   const colors = React.useMemo(() => {
@@ -648,6 +685,22 @@ export function CustomerMapView({
       if (!existing) map.addSource(SOURCE_ID, { type: "geojson", data });
       else existing.setData(data);
 
+      // Clustered twin of the dots source — same data, MapLibre aggregates nearby
+      // points into point_count clusters. Kept as a separate source so the dots
+      // source stays unclustered for dots/heatmap modes.
+      const existingCluster = map.getSource(CLUSTER_SOURCE_ID) as GeoJSONSource | undefined;
+      if (!existingCluster) {
+        map.addSource(CLUSTER_SOURCE_ID, {
+          type: "geojson",
+          data,
+          cluster: true,
+          clusterRadius: 44,
+          clusterMaxZoom: 14,
+        });
+      } else {
+        existingCluster.setData(data);
+      }
+
       if (!map.getLayer(HEAT_ID)) {
         map.addLayer({
           id: HEAT_ID,
@@ -655,18 +708,18 @@ export function CustomerMapView({
           source: SOURCE_ID,
           paint: {
             "heatmap-weight": 1,
-            "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 5, 0.8, 12, 2.5],
-            "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 5, 14, 12, 30],
+            "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 5, 0.5, 12, 1.1],
+            "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 5, 18, 12, 34],
             "heatmap-opacity": 0.85,
             "heatmap-color": [
               "interpolate",
               ["linear"],
               ["heatmap-density"],
               0, "rgba(37,99,235,0)",
-              0.2, "rgba(37,99,235,0.55)",
-              0.4, "#22c55e",
-              0.6, "#eab308",
-              0.8, "#f97316",
+              0.28, "rgba(37,99,235,0.55)",
+              0.5, "#22c55e",
+              0.7, "#eab308",
+              0.88, "#f97316",
               1, "#ef4444",
             ],
           },
@@ -688,12 +741,66 @@ export function CustomerMapView({
         });
       }
 
+      if (!map.getLayer(CLUSTER_CIRCLE_ID)) {
+        map.addLayer({
+          id: CLUSTER_CIRCLE_ID,
+          type: "circle",
+          source: CLUSTER_SOURCE_ID,
+          filter: ["has", "point_count"],
+          paint: {
+            // Canvas paints (see resolveAccentColor) — explicit Okabe–Ito-ish
+            // steps by cluster size; theme tokens cannot reach WebGL.
+            "circle-color": ["step", ["get", "point_count"], "#0072B2", 10, "#E69F00", 50, "#D55E00"],
+            "circle-radius": ["step", ["get", "point_count"], 15, 10, 20, 50, 26],
+            "circle-opacity": 0.85,
+            "circle-stroke-color": MARKER_STROKE_COLOR,
+            "circle-stroke-width": 1.5,
+          },
+        });
+      }
+
+      if (!map.getLayer(CLUSTER_COUNT_ID)) {
+        map.addLayer({
+          id: CLUSTER_COUNT_ID,
+          type: "symbol",
+          source: CLUSTER_SOURCE_ID,
+          filter: ["has", "point_count"],
+          layout: {
+            "text-field": ["get", "point_count_abbreviated"],
+            "text-size": 12,
+          },
+          // No text-font: the OpenFreeMap styles supply the glyphs and MapLibre
+          // falls back to the style default — an invented stack would break labels.
+          paint: { "text-color": "#ffffff" },
+        });
+      }
+
+      if (!map.getLayer(CLUSTER_POINT_ID)) {
+        map.addLayer({
+          id: CLUSTER_POINT_ID,
+          type: "circle",
+          source: CLUSTER_SOURCE_ID,
+          filter: ["!", ["has", "point_count"]],
+          paint: {
+            "circle-color": ["get", "color"],
+            "circle-radius": ["interpolate", ["linear"], ["zoom"], 4, 3, 8, 5, 12, 7, 16, 10],
+            "circle-stroke-color": MARKER_STROKE_COLOR,
+            "circle-stroke-width": 1,
+            "circle-opacity": 0.9,
+          },
+        });
+      }
+
       const show = (id: string, visible: boolean) => {
         if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visible ? "visible" : "none");
       };
       const isHeat = state.markerStyle === "heatmap";
+      const isClusters = state.markerStyle === "clusters";
       show(HEAT_ID, isHeat);
-      show(CIRCLE_ID, !isHeat);
+      show(CIRCLE_ID, !isHeat && !isClusters);
+      show(CLUSTER_CIRCLE_ID, isClusters);
+      show(CLUSTER_COUNT_ID, isClusters);
+      show(CLUSTER_POINT_ID, isClusters);
 
       applyBoundaryLayers(map, state.boundaryHighlight);
     } catch {
@@ -727,11 +834,74 @@ export function CustomerMapView({
       instance.addControl(new maplibregl.ScaleControl({ maxWidth: 100 }), "bottom-left");
 
       // Generic handlers survive style swaps (layer-bound handlers do not).
-      const hitLayers = (): string[] => [CIRCLE_ID].filter((id) => instance.getLayer(id));
+      // Hit layers follow the active style: dots read the plain circle layer,
+      // clusters read the cluster aggregates + unclustered points, heatmap has
+      // no clickable features.
+      const hitLayers = (): string[] => {
+        const style = latest.current.markerStyle;
+        if (style === "heatmap") return [];
+        const ids =
+          style === "clusters" ? [CLUSTER_CIRCLE_ID, CLUSTER_POINT_ID] : [CIRCLE_ID];
+        return ids.filter((id) => {
+          try {
+            return Boolean(instance.getLayer(id));
+          } catch {
+            return false;
+          }
+        });
+      };
       instance.on("click", (event: MapMouseEvent) => {
-        const layers = hitLayers();
-        const hits = layers.length ? instance.queryRenderedFeatures(event.point, { layers }) : [];
-        setSelected(hits.length ? (hits[0].properties as unknown as CustomerFeatureProps) : null);
+        void (async () => {
+          const layers = hitLayers();
+          if (layers.length === 0) {
+            setSelected(null);
+            return;
+          }
+          const hits = instance.queryRenderedFeatures(event.point, { layers });
+          const unique = dedupeHits(hits);
+          if (unique.length === 0) {
+            setSelected(null);
+            return;
+          }
+          // A cluster aggregate expands to its leaf customers via the source.
+          const clusterHit = unique.find((props) => isClusterFeature(props));
+          if (clusterHit) {
+            const clusterId = Number(clusterHit.cluster_id);
+            try {
+              const source = instance.getSource(CLUSTER_SOURCE_ID) as
+                | GeoJSONSource
+                | undefined;
+              const leaves =
+                source && typeof source.getClusterLeaves === "function"
+                  ? await source.getClusterLeaves(clusterId, Infinity, 0)
+                  : [];
+              const leafProps = dedupeHits(
+                leaves.map((leaf) => ({
+                  properties: (leaf.properties ?? {}) as Record<string, unknown>,
+                })),
+              );
+              const leafCustomers = leafProps.filter(
+                (props) => typeof props.key === "string",
+              ) as unknown as CustomerFeatureProps[];
+              if (leafCustomers.length > 1) {
+                setSelected({ kind: "list", customers: leafCustomers });
+                return;
+              }
+              if (leafCustomers.length === 1) {
+                setSelected({ kind: "single", customer: leafCustomers[0] });
+                return;
+              }
+            } catch {
+              // Cluster expansion failed — fall through to the point hits below.
+            }
+          }
+          const points = unique.filter(
+            (props) => typeof props.key === "string",
+          ) as unknown as CustomerFeatureProps[];
+          if (points.length > 1) setSelected({ kind: "list", customers: points });
+          else if (points.length === 1) setSelected({ kind: "single", customer: points[0] });
+          else setSelected(null);
+        })();
       });
       instance.on("mousemove", (event: MapMouseEvent) => {
         const layers = hitLayers();
@@ -794,9 +964,21 @@ export function CustomerMapView({
   React.useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
-    setSelected((previous) =>
-      previous && customers.some((customer) => customer.key === previous.key) ? previous : null,
-    );
+    setSelected((previous) => {
+      if (!previous) return previous;
+      if (previous.kind === "single") {
+        return customers.some((customer) => customer.key === previous.customer.key)
+          ? previous
+          : null;
+      }
+      const remaining = previous.customers.filter((choice) =>
+        customers.some((customer) => customer.key === choice.key),
+      );
+      if (remaining.length === 0) return null;
+      return remaining.length === previous.customers.length
+        ? previous
+        : { kind: "list", customers: remaining };
+    });
     if (customers.length > 0) {
       let minLng = Infinity;
       let minLat = Infinity;
@@ -860,22 +1042,22 @@ export function CustomerMapView({
         </div>
       )}
 
-      {selected && (
+      {selected?.kind === "single" && (
         <div className="absolute right-3 top-[4.5rem] z-30 w-[min(20rem,calc(100%-1.5rem))]">
           <div className="rounded-xl border border-border/60 bg-card/85 p-4 shadow-lg backdrop-blur-md">
               <div className="flex items-start justify-between gap-3">
                 <div className="flex min-w-0 items-start gap-2">
-                  <MapPin className="mt-0.5 size-4 shrink-0" style={{ color: selected.color }} />
+                  <MapPin className="mt-0.5 size-4 shrink-0" style={{ color: selected.customer.color }} />
                   <div className="min-w-0">
                     <p
                       className="truncate text-sm font-semibold"
-                      title={selected.storeName || selected.customerName}
+                      title={selected.customer.storeName || selected.customer.customerName}
                     >
-                      {selected.storeName || selected.customerName || "Customer"}
+                      {selected.customer.storeName || selected.customer.customerName || "Customer"}
                     </p>
-                    <p className="truncate text-xs text-muted-foreground" title={selected.customerCode}>
-                      {selected.customerName}
-                      {selected.customerCode ? ` · ${selected.customerCode}` : ""}
+                    <p className="truncate text-xs text-muted-foreground" title={selected.customer.customerCode}>
+                      {selected.customer.customerName}
+                      {selected.customer.customerCode ? ` · ${selected.customer.customerCode}` : ""}
                     </p>
                   </div>
                 </div>
@@ -891,20 +1073,87 @@ export function CustomerMapView({
               </div>
 
               <div className="mt-3 space-y-1.5 border-t pt-3">
-                <DetailRow label="Dealer" value={selected.dealerName} />
-                <DetailRow label="Store type" value={selected.storeType} />
-                <DetailRow label="Class" value={selected.classification} />
+                <DetailRow label="Dealer" value={selected.customer.dealerName} />
+                <DetailRow label="Store type" value={selected.customer.storeType} />
+                <DetailRow label="Class" value={selected.customer.classification} />
                 <DetailRow
                   label="City"
-                  value={[selected.city, selected.province].filter(Boolean).join(", ")}
+                  value={[selected.customer.city, selected.customer.province].filter(Boolean).join(", ")}
                 />
-                <DetailRow label="Barangay" value={selected.brgy} />
-                <DetailRow label="Price type" value={selected.priceType} />
-                <DetailRow label="Payment term" value={selected.paymentTerm} />
+                <DetailRow label="Barangay" value={selected.customer.brgy} />
+                <DetailRow label="Price type" value={selected.customer.priceType} />
+                <DetailRow label="Payment term" value={selected.customer.paymentTerm} />
               </div>
             </div>
           </div>
         )}
+
+      {/* Stacked-spot list: every customer rendered at the clicked point or
+          inside the clicked cluster. Picking a row opens that customer's card. */}
+      {selected?.kind === "list" && (
+        <div className="absolute right-3 top-[4.5rem] z-30 w-[min(20rem,calc(100%-1.5rem))]">
+          <div className="rounded-xl border border-border/60 bg-card/85 p-4 shadow-lg backdrop-blur-md">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="truncate text-sm font-semibold" title={`${selected.customers.length} customers at this location`}>
+                  <span className="tabular-nums">{formatNumber(selected.customers.length)}</span>{" "}
+                  customers at this location
+                </p>
+                <p className="truncate text-xs text-muted-foreground">
+                  Select one to see details
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSelected(null)}
+                className="flex size-9 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                aria-label="Close customer list"
+                title="Close customer list"
+              >
+                <X className="size-4" />
+              </button>
+            </div>
+
+            <ul className="mt-3 max-h-64 space-y-1 overflow-y-auto border-t pt-3">
+              {selected.customers.map((customer) => (
+                <li key={customer.key}>
+                  <button
+                    type="button"
+                    onClick={() => setSelected({ kind: "single", customer })}
+                    className="flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent"
+                    aria-label={`Show details for ${customer.storeName || customer.customerName}`}
+                    title={customer.storeName || customer.customerName}
+                  >
+                    <span
+                      className="size-2.5 shrink-0 rounded-full ring-1 ring-border"
+                      style={{ backgroundColor: customer.color }}
+                      aria-hidden
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span
+                        className="block truncate text-xs font-medium"
+                        title={customer.storeName || customer.customerName}
+                      >
+                        {customer.storeName || customer.customerName || "Customer"}
+                      </span>
+                      <span
+                        className="block truncate text-xs tabular-nums text-muted-foreground"
+                        title={[customer.customerName, customer.customerCode].filter(Boolean).join(" · ")}
+                      >
+                        {customer.customerName}
+                        {customer.customerCode ? ` · ${customer.customerCode}` : ""}
+                      </span>
+                      <span className="block truncate text-[11px] text-muted-foreground" title={customer.dealerName}>
+                        {customer.dealerName}
+                      </span>
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
 
       {/* Dealer legend pill — floats bottom-center. The total is plain text;
           each chip is a filter toggle (colour dot + name + count). At most 4

@@ -53,7 +53,7 @@ export default function CustomerMapPage() {
   React.useEffect(() => {
     try {
       const storedMarker = localStorage.getItem(MARKER_STORAGE_KEY);
-      if (storedMarker === "dots" || storedMarker === "heatmap") {
+      if (storedMarker === "dots" || storedMarker === "heatmap" || storedMarker === "clusters") {
         setMarkerStyle(storedMarker);
       }
       const storedBasemap = localStorage.getItem(BASEMAP_STORAGE_KEY);
