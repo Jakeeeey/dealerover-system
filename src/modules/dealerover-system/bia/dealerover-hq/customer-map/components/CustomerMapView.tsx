@@ -567,19 +567,21 @@ function applyBoundaryLayers(map: MapLibreMap, highlight: BoundaryHighlight | nu
     });
   }
 
-  // Enforce bottom-to-top stacking: dim + tint under the points, glow above.
+  // Enforce bottom-to-top stacking: dim + tint + heat wash the base map, then the
+  // border (glow + line + core), then the customer points ON TOP of everything so
+  // no border ever covers a dot.
   for (const id of [
     DIM_ID,
     TINT_ID,
     HEAT_ID,
-    CIRCLE_ID,
-    CLUSTER_CIRCLE_ID,
-    CLUSTER_COUNT_ID,
-    CLUSTER_POINT_ID,
     GLOW_FAR_ID,
     GLOW_NEAR_ID,
     LINE_ID,
     CORE_ID,
+    CIRCLE_ID,
+    CLUSTER_CIRCLE_ID,
+    CLUSTER_COUNT_ID,
+    CLUSTER_POINT_ID,
   ]) {
     try {
       if (map.getLayer(id)) map.moveLayer(id);
@@ -1034,12 +1036,21 @@ export function CustomerMapView({
         minLat = Math.min(minLat, customer.lat);
         maxLat = Math.max(maxLat, customer.lat);
       }
+      // Fit the filtered set. The zoom ceiling is high so small cities / barangays
+      // still fill the view (vector tiles overzoom crisply); the left padding
+      // keeps the region clear of the floating sidebar on desktop.
+      const sidebarInset =
+        typeof window !== "undefined" && window.innerWidth >= 1024 ? 336 : 0;
       map.fitBounds(
         [
           [minLng, minLat],
           [maxLng, maxLat],
         ],
-        { padding: 56, maxZoom: 12, duration: 500 },
+        {
+          padding: { top: 72, bottom: 72, left: 56 + sidebarInset, right: 56 },
+          maxZoom: 18,
+          duration: 600,
+        },
       );
     }
   }, [customers, mapReady]);
