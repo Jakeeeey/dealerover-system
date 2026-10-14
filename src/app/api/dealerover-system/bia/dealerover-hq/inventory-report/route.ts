@@ -1,7 +1,12 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { COOKIE_NAME } from "@/lib/auth-utils";
-import { fetchDealerRoster, fetchInventoryReport } from "@/modules/dealerover-system/bia/dealerover-hq/inventory-report/services/inventory-report-service";
+import {
+  BRANCH_PAGE_SIZE,
+  fetchDealerRoster,
+  fetchInventoryMeta,
+  fetchInventoryPage,
+} from "@/modules/dealerover-system/bia/dealerover-hq/inventory-report/services/inventory-report-service";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,52 +17,89 @@ function parseWindowDays(value: string | null): number {
   return Math.min(365, Math.max(7, Math.trunc(n)));
 }
 
+function parsePage(value: string | null): number | null {
+  if (value === null || value === "") return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.trunc(n);
+}
+
+function parsePageSize(value: string | null): number {
+  if (value === null || value === "") return BRANCH_PAGE_SIZE;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return BRANCH_PAGE_SIZE;
+  return Math.min(30, Math.max(1, Math.trunc(n)));
+}
+
+function isTruthyFlag(value: string | null): boolean {
+  return value === "1" || value === "true";
+}
+
 export async function GET(req: Request) {
   try {
     const cookieStore = await cookies();
     const token = cookieStore.get(COOKIE_NAME)?.value;
 
     if (!token) {
-      return NextResponse.json({ success: false, message: "Unauthorized" }, { status: 401 });
+      return NextResponse.json({ success: false, error: "Unauthorized" }, { status: 401 });
     }
 
     const { searchParams } = new URL(req.url);
-    const includeZero = searchParams.get("includeZero") === "1" || searchParams.get("includeZero") === "true";
-    const windowDays = parseWindowDays(searchParams.get("windowDays"));
 
     if (searchParams.get("roster") === "1") {
       const roster = await fetchDealerRoster();
+      return NextResponse.json({ success: true, roster }, { status: 200 });
+    }
+
+    const dealerId = searchParams.get("dealerId")?.trim() || "";
+    if (!dealerId) {
       return NextResponse.json(
-        {
-          success: true,
-          data: {
-            success: true,
-            generatedAt: new Date().toISOString(),
-            windowDays,
-            includeZero,
-            dealers: [],
-            rows: [],
-            stockOuts: [],
-            roster,
-          },
-        },
-        { status: 200 },
+        { success: false, error: "Missing required query parameter: dealerId" },
+        { status: 400 },
       );
     }
 
-    const dealerIds = searchParams.getAll("dealerIds").flatMap((v) => v.split(",")).map((v) => v.trim()).filter(Boolean);
-    const single = searchParams.get("dealerId")?.trim();
-    if (single) dealerIds.push(single);
-
-    const data = await fetchInventoryReport({ dealerIds, includeZero, windowDays });
-    if (!data.success) {
-      return NextResponse.json({ success: false, message: data.error ?? "Failed to load inventory report" }, { status: 500 });
+    if (isTruthyFlag(searchParams.get("meta"))) {
+      const refresh = isTruthyFlag(searchParams.get("refresh"));
+      const meta = await fetchInventoryMeta(dealerId, { refresh });
+      // Business-level failures (offline dealer with its reason) still ride
+      // inside the schema payload so the client can read dealer.reason; only
+      // an unknown dealer is a 404.
+      if (!meta.success && meta.error === "Unknown dealer") {
+        return NextResponse.json(meta, { status: 404 });
+      }
+      return NextResponse.json(meta, { status: 200 });
     }
-    return NextResponse.json({ success: true, data }, { status: 200 });
+
+    const rawPage = parsePage(searchParams.get("page"));
+    if (rawPage === null) {
+      return NextResponse.json(
+        { success: false, error: "Missing required query parameter: page" },
+        { status: 400 },
+      );
+    }
+
+    const pageSize = parsePageSize(searchParams.get("pageSize"));
+    const windowDays = parseWindowDays(searchParams.get("windowDays"));
+    const includeZero = isTruthyFlag(searchParams.get("includeZero"));
+    const bypassCache = isTruthyFlag(searchParams.get("refresh"));
+
+    const page = await fetchInventoryPage(dealerId, rawPage, pageSize, {
+      windowDays,
+      includeZero,
+      bypassCache,
+    });
+    // A failed stock page still rides inside the schema payload (with its
+    // error) so the client keeps the rows streamed so far; only an unknown
+    // dealer is a 404.
+    if (!page.success && page.error === "Unknown dealer") {
+      return NextResponse.json(page, { status: 404 });
+    }
+    return NextResponse.json(page, { status: 200 });
   } catch (error) {
     console.error("[InventoryReport API] Unexpected error:", error);
     return NextResponse.json(
-      { success: false, message: error instanceof Error ? error.message : String(error) },
+      { success: false, error: error instanceof Error ? error.message : String(error) },
       { status: 500 },
     );
   }

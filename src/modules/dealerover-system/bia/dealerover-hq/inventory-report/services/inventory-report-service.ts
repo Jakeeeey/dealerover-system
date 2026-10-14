@@ -1,20 +1,33 @@
 import { dealeroverCache } from "@/modules/dealerover-system/bia/dealer/dealerover-kpi/utils/cache";
 import type {
+  BranchKind,
+  DealerBranch,
   DealerRosterEntry,
-  DealerStatus,
-  InventoryReportParams,
-  InventoryReportResponse,
+  InventoryMetaResponse,
+  InventoryPageResponse,
   InventoryRow,
-  StockOutItem,
+  MasterProduct,
 } from "../types";
 
 /**
  * Server-only aggregation for the HQ inventory report.
  *
  * Roster lives on head-office Directus; each dealer owns its Spring Boot
- * running-inventory view plus its own Directus product master. A failing
- * dealer is reported offline and contributes no rows — never fatal.
+ * running-inventory view plus its own Directus product master. One dealer is
+ * loaded at a time: the client first reads the meta payload (branches +
+ * product master, no stock) and then streams one branch-batch of stock rows
+ * per page request. A failing dealer is reported offline, never fatal.
  */
+
+/** Server default branch-batch size; reported back on the meta response. */
+/**
+ * Branches per stock request. Deliberately coarse: the dealer backends
+ * rate-limit by REQUEST COUNT (measured: 3 requests per ~20 s window, then
+ * HTTP 429 with Retry-After), so a whole dealer must load in a handful of
+ * requests. Rows are only a few hundred KB per branch, while an extra request
+ * costs a 20 s penalty.
+ */
+export const BRANCH_PAGE_SIZE = 10;
 
 const UPSTREAM = (process.env.NEXT_PUBLIC_API_BASE_URL || "").replace(/\/+$/, "");
 const STATIC_TOKEN = process.env.DIRECTUS_STATIC_TOKEN || "";
@@ -27,7 +40,7 @@ type LoginOutcome =
   | { ok: true; token: string }
   | { ok: false; reason: "credentials-missing" | "credentials-rejected" | "login-rejected" | "unreachable" };
 
-type StockFailure = "unreachable" | "timeout" | "http-error";
+type StockFailure = "unreachable" | "timeout" | "http-error" | "rate-limited";
 
 type DealerFailureReason =
   | "credentials-missing"
@@ -36,6 +49,7 @@ type DealerFailureReason =
   | "unreachable"
   | "timeout"
   | "http-error"
+  | "rate-limited"
   | "product-master-unreachable";
 
 const DEALER_FAILURE_MESSAGES: Record<DealerFailureReason, string> = {
@@ -45,16 +59,28 @@ const DEALER_FAILURE_MESSAGES: Record<DealerFailureReason, string> = {
   "login-rejected": "Dealer backend rejected the login request",
   timeout: "Dealer backend timed out while reading inventory",
   unreachable: "Dealer backend unreachable",
-  "http-error": "Dealer backend unreachable",
+  "http-error": "Dealer backend returned an error response",
+  "rate-limited": "Dealer backend is throttling requests (too many in one window)",
   "product-master-unreachable": "Dealer product master unreachable",
 };
 
 function classifyStockError(err: unknown): StockFailure {
   const name = err instanceof Error ? err.name : "";
   if (name === "TimeoutError" || name === "AbortError") return "timeout";
+  if (isHttpError(err)) return err.status === 429 ? "rate-limited" : "http-error";
   const message = err instanceof Error ? err.message : String(err ?? "");
   if (/^HTTP \d+/.test(message)) return "http-error";
   return "unreachable";
+}
+
+function isAuthError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  return /^HTTP 401\b/.test(message) || /^HTTP 403\b/.test(message);
+}
+
+function toDealerReason(err: unknown): DealerFailureReason {
+  const failure = classifyStockError(err);
+  return failure === "http-error" ? "http-error" : failure;
 }
 
 const DEALER_LIST_FIELDS =
@@ -64,6 +90,9 @@ const ROSTER_TIMEOUT_MS = 6000;
 const INVENTORY_TIMEOUT_MS = 60000;
 const MASTER_TIMEOUT_MS = 10000;
 const CACHE_TTL_MS = 5 * 60 * 1000;
+const SPRING_TOKEN_TTL_MS = 10 * 60 * 1000;
+const PAGE_CACHE_TTL_MS = 3 * 60 * 1000;
+const MASTER_PAGE_LIMIT = 1000;
 
 const PRODUCT_FIELDS = [
   "product_id",
@@ -149,6 +178,10 @@ interface RawBranch {
   id?: number | string | null;
   branch_code?: string | null;
   branch_name?: string | null;
+  isActive?: number | string | boolean | null;
+  isBadStock?: number | string | boolean | null;
+  isMoving?: number | string | boolean | null;
+  isReturn?: number | string | boolean | null;
 }
 
 interface RawInvoice {
@@ -183,6 +216,11 @@ interface RawSupplier {
   supplier_shortcut?: string | null;
 }
 
+interface DealerContext {
+  branches: DealerBranch[];
+  products: MasterProduct[];
+}
+
 function toInt(value: unknown): number {
   if (typeof value === "boolean") return value ? 1 : 0;
   const n = Number(value);
@@ -205,11 +243,45 @@ function extractData<T>(payload: unknown): T[] {
   return Array.isArray(data) ? (data as T[]) : [];
 }
 
+function normalizeWindowDays(value: unknown): number {
+  return Math.min(365, Math.max(7, Math.trunc(toNum(value)) || 30));
+}
+
+function normalizePageSize(value: unknown): number {
+  const n = Math.trunc(toNum(value));
+  if (!Number.isFinite(n) || n <= 0) return BRANCH_PAGE_SIZE;
+  return Math.min(30, Math.max(1, n));
+}
+
+/** HTTP failure that keeps the status and Retry-After so 429 can be paced. */
+class HttpError extends Error {
+  readonly status: number;
+  readonly retryAfterSeconds: number | null;
+
+  constructor(status: number, body: string, retryAfterSeconds: number | null) {
+    super(`HTTP ${status}${body ? `: ${body.slice(0, 180)}` : ""}`);
+    this.name = "HttpError";
+    this.status = status;
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+function isHttpError(err: unknown): err is HttpError {
+  return err instanceof HttpError;
+}
+
+/** Parses a Retry-After header (the numeric-seconds form; dates are ignored). */
+function parseRetryAfter(value: string | null): number | null {
+  if (!value) return null;
+  const seconds = Number(value.trim());
+  return Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds) : null;
+}
+
 async function fetchJson(url: string, headers: Record<string, string>, signal: AbortSignal): Promise<unknown> {
   const res = await fetch(url, { method: "GET", headers, cache: "no-store", signal });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status}${body ? `: ${body.slice(0, 180)}` : ""}`);
+    throw new HttpError(res.status, body, parseRetryAfter(res.headers.get("retry-after")));
   }
   return res.json();
 }
@@ -262,6 +334,33 @@ async function loginToDealerSpringBoot(springbootUrl: string): Promise<LoginOutc
   }
 }
 
+/**
+ * Spring Boot bearer tokens, keyed by the dealer's Spring base URL. Ten page
+ * requests for one dealer share a single login instead of logging in ten
+ * times.
+ */
+const SPRING_TOKEN_CACHE = new Map<string, { token: string; expiry: number }>();
+
+function clearSpringToken(springBase: string): void {
+  SPRING_TOKEN_CACHE.delete(springBase);
+}
+
+/**
+ * Returns a cached Spring Boot token for the dealer, logging in when no
+ * fresh token exists.
+ */
+async function getSpringToken(springBase: string, forceRefresh = false): Promise<LoginOutcome> {
+  if (!forceRefresh) {
+    const hit = SPRING_TOKEN_CACHE.get(springBase);
+    if (hit && hit.expiry > Date.now()) return { ok: true, token: hit.token };
+  }
+  const login = await loginToDealerSpringBoot(springBase);
+  if (login.ok) {
+    SPRING_TOKEN_CACHE.set(springBase, { token: login.token, expiry: Date.now() + SPRING_TOKEN_TTL_MS });
+  }
+  return login;
+}
+
 const DEALER_LIST_CACHE: { data: DealerRow[] | null; expiry: number } = { data: null, expiry: 0 };
 
 async function getCachedDealerList(): Promise<DealerRow[]> {
@@ -280,23 +379,117 @@ async function getCachedDealerList(): Promise<DealerRow[]> {
   return rows;
 }
 
-async function fetchInventoryWithRetry(base: string, token: string): Promise<RawInventory[]> {
-  const url = `${base}/api/view-running-inventory/filter`;
-  const headers: Record<string, string> = {
+function findDealer(roster: DealerRow[], dealerId: string): DealerRow | null {
+  return roster.find((d) => String(d.dealer_id) === dealerId) ?? null;
+}
+
+function dealerHeaders(dealer: DealerRow): Record<string, string> {
+  return {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${token}`,
+    Authorization: `Bearer ${dealer.directus_token || ""}`,
   };
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+}
+
+type StockResult =
+  | { ok: true; rows: RawInventory[] }
+  | { ok: false; reason: DealerFailureReason; detail?: string };
+
+const STOCK_MAX_ATTEMPTS = 3;
+/** Ceiling for a Retry-After wait so one page cannot hang the request forever. */
+const STOCK_MAX_RATE_LIMIT_WAIT_SECONDS = 30;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/** Short, non-secret detail that makes a failure message diagnosable. */
+function describeStockError(err: unknown): string | undefined {
+  if (isHttpError(err)) return `HTTP ${err.status}`;
+  if (err instanceof Error && err.name) return err.name;
+  return undefined;
+}
+
+/**
+ * Reads one branch-batch of running-inventory rows. The dealer backend
+ * ignores limit/offset-style paging, so callers pass the wanted branch ids
+ * as repeated `branchId` params and the backend returns those branches' rows.
+ *
+ * Failure handling, in order:
+ * - 401/403 clears the cached Spring token and retries with a fresh login.
+ * - 429 honours Retry-After (capped) and retries, because the dealer backends
+ *   allow only a few requests per window — pacing beats failing the stream.
+ * - a timeout is never retried (this call is already the slowest we make).
+ * - any other failure gets one plain retry.
+ */
+async function fetchStockForBranches(springBase: string, branchIds: number[]): Promise<StockResult> {
+  const query = branchIds.map((id) => `branchId=${encodeURIComponent(String(id))}`).join("&");
+  const url = `${springBase}/api/view-running-inventory/filter?${query}`;
+
+  let login = await getSpringToken(springBase);
+  if (!login.ok) return { ok: false, reason: login.reason };
+  let token = login.token;
+  let lastError: unknown = null;
+  let plainRetryUsed = false;
+
+  for (let attempt = 1; attempt <= STOCK_MAX_ATTEMPTS; attempt += 1) {
     try {
-      const payload = await fetchJson(url, headers, AbortSignal.timeout(INVENTORY_TIMEOUT_MS));
-      return extractData<RawInventory>(payload);
+      const payload = await fetchJson(
+        url,
+        { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        AbortSignal.timeout(INVENTORY_TIMEOUT_MS),
+      );
+      return { ok: true, rows: extractData<RawInventory>(payload) };
     } catch (err) {
+      lastError = err;
+
+      if (isAuthError(err)) {
+        console.error(
+          `ERR_AUTH_FAIL: [InventoryReport] Stock token rejected for ${springBase}, refreshing login`,
+        );
+        clearSpringToken(springBase);
+        login = await getSpringToken(springBase, true);
+        if (!login.ok) return { ok: false, reason: login.reason };
+        token = login.token;
+        continue;
+      }
+
+      if (isHttpError(err) && err.status === 429) {
+        const waitSeconds = Math.min(err.retryAfterSeconds ?? 20, STOCK_MAX_RATE_LIMIT_WAIT_SECONDS);
+        if (attempt >= STOCK_MAX_ATTEMPTS) {
+          console.error(
+            `ERR_RATE_LIMIT: [InventoryReport] ${springBase} still throttling after ${attempt} attempts`,
+          );
+          return { ok: false, reason: "rate-limited", detail: `HTTP 429 after ${attempt} attempts` };
+        }
+        console.warn(
+          `ERR_RATE_LIMIT: [InventoryReport] ${springBase} returned 429; waiting ${waitSeconds}s (attempt ${attempt})`,
+        );
+        await sleep(waitSeconds * 1000);
+        continue;
+      }
+
       // A timeout retry would double a 60 s wait to 120 s for no benefit.
-      if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) throw err;
-      if (attempt === 1) throw err;
+      if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) {
+        console.error(`ERR_API_FAIL: [InventoryReport] Stock request timed out for ${url}:`, err);
+        return { ok: false, reason: "timeout" };
+      }
+
+      console.error(`ERR_API_FAIL: [InventoryReport] Stock request failed for ${url}:`, err);
+      if (!plainRetryUsed && attempt < STOCK_MAX_ATTEMPTS) {
+        plainRetryUsed = true;
+        continue;
+      }
+      return { ok: false, reason: toDealerReason(err), detail: describeStockError(err) };
     }
   }
-  return [];
+
+  return {
+    ok: false,
+    reason: toDealerReason(lastError),
+    detail: describeStockError(lastError),
+  };
 }
 
 async function getCachedCollection<T>(key: string, url: string, headers: Record<string, string>): Promise<T[]> {
@@ -306,6 +499,20 @@ async function getCachedCollection<T>(key: string, url: string, headers: Record<
   const rows = extractData<T>(payload);
   dealeroverCache.set(key, rows, CACHE_TTL_MS);
   return rows;
+}
+
+/**
+ * Derives the physical role of a branch from the dealer's own branch flags.
+ * Bad-stock twins win over the return flag they also carry; a missing row
+ * maps to "other".
+ */
+export function classifyBranchKind(branch: RawBranch | null | undefined): BranchKind {
+  if (!branch) return "other";
+  if (toInt(branch.isBadStock) !== 0) return "bad_stock";
+  if (toInt(branch.isReturn) !== 0) return "return";
+  if (toInt(branch.isMoving) !== 0) return "moving";
+  if (/warehouse|central/i.test(str(branch.branch_name))) return "warehouse";
+  return "selling";
 }
 
 /**
@@ -351,225 +558,119 @@ function buildDemandByKey(
   return demandByKey;
 }
 
-async function fetchDealerReport(dealer: DealerRow, windowDays: number, includeZero: boolean): Promise<{
-  status: DealerStatus;
-  rows: InventoryRow[];
-  stockOuts: StockOutItem[];
-}> {
-  const dealerId = String(dealer.dealer_id);
-  const dealerName = str(dealer.dealer_name) || `Dealer ${dealerId}`;
-  const dealerCode = str(dealer.dealer_code);
-  const fail = (
-    reason: DealerFailureReason,
-  ): { status: DealerStatus; rows: InventoryRow[]; stockOuts: StockOutItem[] } => ({
-    status: { dealerId, dealerName, dealerCode, online: false, rowCount: 0, error: DEALER_FAILURE_MESSAGES[reason], reason },
-    rows: [],
-    stockOuts: [],
-  });
-
-  const springBase = str(dealer.springboot).replace(/\/+$/, "");
-  const directusBase = str(dealer.directus).replace(/\/+$/, "");
-  if (!springBase || !directusBase) {
-    return fail("unreachable");
-  }
-
-  const login = await loginToDealerSpringBoot(springBase);
-  if (!login.ok) {
-    return fail(login.reason);
-  }
-  const token = login.token;
-
-  let rawInventory: RawInventory[];
-  try {
-    rawInventory = await fetchInventoryWithRetry(springBase, token);
-  } catch (err) {
-    console.error(`ERR_API_FAIL: [InventoryReport] Dealer "${dealerName}" inventory unreachable:`, err);
-    const failure = classifyStockError(err);
-    return fail(failure === "http-error" ? "http-error" : failure);
-  }
-
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${dealer.directus_token || ""}`,
-  };
-
-  let products: RawProduct[];
-  let branches: RawBranch[];
-  let invoices: RawInvoice[];
-  let invoiceLines: RawInvoiceDetail[];
-  let brands: RawBrand[];
-  let categories: RawCategory[];
-  let suppliers: RawSupplier[];
-  try {
-    const settled = await Promise.allSettled([
-      getCachedCollection<RawProduct>(
-        `inventory-report:${dealerId}:products`,
-        `${directusBase}/items/products?limit=-1&fields=${PRODUCT_FIELDS}`,
-        headers,
-      ),
-      getCachedCollection<RawBranch>(
-        `inventory-report:${dealerId}:branches`,
-        `${directusBase}/items/branches?limit=-1&fields=${BRANCH_FIELDS}`,
-        headers,
-      ),
-      getCachedCollection<RawInvoice>(
-        `inventory-report:${dealerId}:invoices`,
-        `${directusBase}/items/sales_invoice?limit=-1&fields=${SALES_INVOICE_FIELDS}`,
-        headers,
-      ),
-      getCachedCollection<RawInvoiceDetail>(
-        `inventory-report:${dealerId}:invoice-lines`,
-        `${directusBase}/items/sales_invoice_details?limit=-1&fields=${SALES_DETAIL_FIELDS}`,
-        headers,
-      ),
-      getCachedCollection<RawBrand>(
-        `inventory-report:${dealerId}:brands`,
-        `${directusBase}/items/brand?limit=-1&fields=${BRAND_FIELDS}`,
-        headers,
-      ),
-      getCachedCollection<RawCategory>(
-        `inventory-report:${dealerId}:categories`,
-        `${directusBase}/items/categories?limit=-1&fields=${CATEGORY_FIELDS}`,
-        headers,
-      ),
-      getCachedCollection<RawSupplier>(
-        `inventory-report:${dealerId}:suppliers`,
-        `${directusBase}/items/suppliers?limit=-1&fields=${SUPPLIER_FIELDS}`,
-        headers,
-      ),
-    ]);
-    if (settled[0].status === "rejected" || settled[1].status === "rejected") {
-      throw settled[0].status === "rejected" ? settled[0].reason : (settled[1] as PromiseRejectedResult).reason;
+/**
+ * Reads the dealer's whole active product master through limit/offset paging
+ * (`sort=product_id`, explicit fields, `isActive=1` filter — the collection
+ * is too large for a single `limit=-1` read) and resolves brand/category
+ * names through the cached lookups.
+ */
+async function fetchMasterProducts(
+  directusBase: string,
+  headers: Record<string, string>,
+  brandById: Map<number, string>,
+  categoryById: Map<number, string>,
+): Promise<MasterProduct[]> {
+  const products: MasterProduct[] = [];
+  const seen = new Set<number>();
+  let offset = 0;
+  for (;;) {
+    const url =
+      `${directusBase}/items/products?limit=${MASTER_PAGE_LIMIT}&offset=${offset}` +
+      `&sort=product_id&fields=${PRODUCT_FIELDS}&filter[isActive][_eq]=1`;
+    const payload = await fetchJson(url, headers, AbortSignal.timeout(MASTER_TIMEOUT_MS));
+    const batch = extractData<RawProduct>(payload);
+    for (const p of batch) {
+      const pid = toInt(p.product_id);
+      if (pid <= 0 || seen.has(pid)) continue;
+      if (toInt(p.isActive) === 0) continue;
+      seen.add(pid);
+      products.push({
+        productId: pid,
+        productCode: str(p.product_code),
+        productName: str(p.product_name),
+        brand: brandById.get(toInt(p.product_brand)) ?? "",
+        category: categoryById.get(toInt(p.product_category)) ?? "",
+        unitCount: toNum(p.unit_of_measurement_count),
+        costPerUnit: toNum(p.cost_per_unit),
+        maintainingQuantity: toNum(p.maintaining_quantity),
+      });
     }
-    products = settled[0].status === "fulfilled" ? settled[0].value : [];
-    branches = settled[1].status === "fulfilled" ? settled[1].value : [];
-    invoices = settled[2].status === "fulfilled" ? settled[2].value : [];
-    invoiceLines = settled[3].status === "fulfilled" ? settled[3].value : [];
-    brands = settled[4].status === "fulfilled" ? settled[4].value : [];
-    categories = settled[5].status === "fulfilled" ? settled[5].value : [];
-    suppliers = settled[6].status === "fulfilled" ? settled[6].value : [];
-  } catch (err) {
-    console.error(`ERR_API_FAIL: [InventoryReport] Dealer "${dealerName}" master unreachable:`, err);
-    return fail("product-master-unreachable");
+    if (batch.length < MASTER_PAGE_LIMIT) break;
+    offset += MASTER_PAGE_LIMIT;
+  }
+  return products;
+}
+
+/**
+ * Builds and caches one dealer's branch list plus its active product master
+ * (TTL 5 min). Never touches stock — the meta and page entry points share
+ * this so every page request reuses the same join basis.
+ */
+async function ensureDealerContext(
+  dealer: DealerRow,
+  opts?: { refresh?: boolean },
+): Promise<DealerContext> {
+  const dealerId = String(dealer.dealer_id);
+  const cacheKey = `inventory-report:${dealerId}:context`;
+  if (!opts?.refresh) {
+    const hit = dealeroverCache.get<DealerContext>(cacheKey);
+    if (hit) return hit;
   }
 
-  const productById = new Map<number, RawProduct>();
-  for (const p of products) {
-    const pid = toInt(p.product_id);
-    if (pid > 0 && !productById.has(pid)) productById.set(pid, p);
-  }
-  const branchNameById = new Map<number, string>();
-  for (const b of branches) {
+  const directusBase = str(dealer.directus).replace(/\/+$/, "");
+  const headers = dealerHeaders(dealer);
+
+  const rawBranches = await getCachedCollection<RawBranch>(
+    `inventory-report:${dealerId}:branches`,
+    `${directusBase}/items/branches?limit=-1&fields=${BRANCH_FIELDS}`,
+    headers,
+  );
+  const branches: DealerBranch[] = [];
+  const seenBranches = new Set<number>();
+  for (const b of rawBranches) {
     const bid = toInt(b.id);
-    if (bid > 0) branchNameById.set(bid, str(b.branch_name));
+    if (bid <= 0 || seenBranches.has(bid)) continue;
+    seenBranches.add(bid);
+    branches.push({
+      branchId: bid,
+      branchName: str(b.branch_name) || `Branch ${bid}`,
+      kind: classifyBranchKind(b),
+    });
   }
+  branches.sort((a, b) => a.branchId - b.branchId);
+
+  const settled = await Promise.allSettled([
+    getCachedCollection<RawBrand>(
+      `inventory-report:${dealerId}:brands`,
+      `${directusBase}/items/brand?limit=-1&fields=${BRAND_FIELDS}`,
+      headers,
+    ),
+    getCachedCollection<RawCategory>(
+      `inventory-report:${dealerId}:categories`,
+      `${directusBase}/items/categories?limit=-1&fields=${CATEGORY_FIELDS}`,
+      headers,
+    ),
+  ]);
   const brandById = new Map<number, string>();
-  for (const b of brands) {
-    const bid = toInt(b.brand_id);
-    if (bid > 0) brandById.set(bid, str(b.brand_name));
+  if (settled[0].status === "fulfilled") {
+    for (const b of settled[0].value) {
+      const bid = toInt(b.brand_id);
+      if (bid > 0) brandById.set(bid, str(b.brand_name));
+    }
   }
   const categoryById = new Map<number, string>();
-  for (const c of categories) {
-    const cid = toInt(c.category_id);
-    if (cid > 0) categoryById.set(cid, str(c.category_name));
-  }
-  const supplierShortcutById = new Map<number, string>();
-  for (const s of suppliers) {
-    const sid = toInt(s.id);
-    if (sid > 0) supplierShortcutById.set(sid, str(s.supplier_shortcut));
+  if (settled[1].status === "fulfilled") {
+    for (const c of settled[1].value) {
+      const cid = toInt(c.category_id);
+      if (cid > 0) categoryById.set(cid, str(c.category_name));
+    }
   }
 
-  // Demand basis: the dealer's own invoices over the trailing window.
-  const windowStart = Date.now() - Math.max(windowDays, 1) * 24 * 60 * 60 * 1000;
-  const packById = new Map<number, number>();
-  for (const [pid, master] of productById) {
-    const pack = toNum(master.unit_of_measurement_count);
-    if (pack > 0) packById.set(pid, pack);
-  }
-  const demandByKey = buildDemandByKey(invoices, invoiceLines, packById, windowStart);
+  const products = await fetchMasterProducts(directusBase, headers, brandById, categoryById);
 
-  const rows: InventoryRow[] = [];
-  const nonZeroProductIds = new Set<number>();
-
-  for (const raw of rawInventory) {
-    const running = toNum(raw.runningInventory);
-    if (running <= 0 && !includeZero) continue;
-    const productId = toInt(raw.productId);
-    const branchId = toInt(raw.branchId);
-    if (productId <= 0 || branchId <= 0) continue;
-    const master = productById.get(productId);
-    const rawUnitCount = toNum(raw.unitCount);
-    const masterPack = master ? toNum(master.unit_of_measurement_count) : 0;
-    const unitCount = rawUnitCount > 0 ? rawUnitCount : masterPack > 0 ? masterPack : 0;
-    const costPerUnit = master ? toNum(master.cost_per_unit) : 0;
-    const maintainingQuantity = master ? toNum(master.maintaining_quantity) : 0;
-    const rawBrand = str(raw.productBrand);
-    const rawCategory = str(raw.productCategory);
-    const fallbackBrand = master ? (brandById.get(toInt(master.product_brand)) ?? "") : "";
-    const fallbackCategory = master ? (categoryById.get(toInt(master.product_category)) ?? "") : "";
-    const rawShortcut = str(raw.supplierShortcut);
-    const supplierId = toInt(raw.supplierId);
-    const fallbackShortcut = supplierShortcutById.get(supplierId) ?? "";
-
-    if (running > 0) nonZeroProductIds.add(productId);
-
-    rows.push({
-      key: `${dealerId}:${str(raw.id) || `${branchId}-${productId}`}`,
-      dealerId,
-      dealerName,
-      dealerCode,
-      branchId,
-      branchName: str(raw.branchName) || branchNameById.get(branchId) || `Branch ${branchId}`,
-      productId,
-      productCode: str(raw.productCode),
-      productName: str(raw.productName),
-      productBarcode: str(raw.productBarcode),
-      productBrand: rawBrand || fallbackBrand,
-      productCategory: rawCategory || fallbackCategory,
-      supplierShortcut: rawShortcut || fallbackShortcut,
-      unitName: str(raw.unitName),
-      unitCount,
-      onHand: running,
-      lastCount: toNum(raw.lastCount),
-      movementAfter: toNum(raw.movementAfter),
-      lastCutoff: str(raw.lastCutoff),
-      costPerUnit,
-      maintainingQuantity,
-      demandQty: demandByKey.get(`${productId}:${branchId}`) ?? 0,
-    });
-  }
-
-  const stockOuts: StockOutItem[] = [];
-  const branchIds = new Set<number>();
-  for (const row of rows) branchIds.add(row.branchId);
-  // Branch count for a stock-out = distinct branches seen for this dealer
-  // (the running view lists every active product x branch, so this is the
-  // branch universe the product is absent from).
-  const branchCount = branchIds.size > 0 ? branchIds.size : branches.length;
-  for (const p of products) {
-    const pid = toInt(p.product_id);
-    if (pid <= 0) continue;
-    if (toInt(p.isActive) === 0) continue;
-    if (nonZeroProductIds.has(pid)) continue;
-    stockOuts.push({
-      key: `${dealerId}:stockout:${pid}`,
-      dealerId,
-      dealerName,
-      productId: pid,
-      productCode: str(p.product_code),
-      productName: str(p.product_name),
-      brand: brandById.get(toInt(p.product_brand)) ?? "",
-      category: categoryById.get(toInt(p.product_category)) ?? "",
-      costPerUnit: toNum(p.cost_per_unit),
-      branchCount,
-    });
-  }
-
-  return {
-    status: { dealerId, dealerName, dealerCode, online: true, rowCount: rows.length },
-    rows,
-    stockOuts,
-  };
+  const ctx: DealerContext = { branches, products };
+  dealeroverCache.set(cacheKey, ctx, CACHE_TTL_MS);
+  return ctx;
 }
 
 /**
@@ -585,25 +686,46 @@ export async function fetchDealerRoster(): Promise<DealerRosterEntry[]> {
   }));
 }
 
-/**
- * Aggregates every dealer's running inventory into one HQ report payload.
- */
-export async function fetchInventoryReport(params: InventoryReportParams): Promise<InventoryReportResponse> {
-  const windowDays = Math.min(365, Math.max(7, Math.trunc(params.windowDays ?? 30) || 30));
-  const includeZero = params.includeZero === true;
-  const empty: InventoryReportResponse = {
-    success: true,
-    generatedAt: new Date().toISOString(),
-    windowDays,
-    includeZero,
-    dealers: [],
-    rows: [],
-    stockOuts: [],
+function offlineMeta(
+  dealerId: string,
+  dealerName: string,
+  dealerCode: string,
+  reason: DealerFailureReason,
+  success: boolean,
+): InventoryMetaResponse {
+  return {
+    success,
+    dealer: {
+      dealerId,
+      dealerName,
+      dealerCode,
+      online: false,
+      rowCount: 0,
+      error: DEALER_FAILURE_MESSAGES[reason],
+      reason,
+    },
+    branches: [],
+    products: [],
+    totalBranches: 0,
+    branchPageSize: BRANCH_PAGE_SIZE,
+    error: DEALER_FAILURE_MESSAGES[reason],
   };
+}
+
+/**
+ * Loads one dealer's branches plus its whole active product master. Never
+ * fetches stock — the client pages stock separately. A failing dealer is
+ * reported offline (with a self-diagnosing reason) instead of throwing.
+ */
+export async function fetchInventoryMeta(
+  dealerId: string,
+  opts?: { refresh?: boolean },
+): Promise<InventoryMetaResponse> {
+  const id = str(dealerId);
 
   if (!UPSTREAM) {
     console.error("ERR_CONFIG: [InventoryReport] NEXT_PUBLIC_API_BASE_URL is not defined");
-    return { ...empty, success: false, error: "Server configuration error" };
+    return offlineMeta(id, `Dealer ${id}`, "", "unreachable", false);
   }
 
   let roster: DealerRow[];
@@ -611,39 +733,257 @@ export async function fetchInventoryReport(params: InventoryReportParams): Promi
     roster = await getCachedDealerList();
   } catch (error) {
     console.error("ERR_API_FAIL: [InventoryReport] Failed to load dealer roster:", error);
-    return { ...empty, success: false, error: "Unable to reach the dealer registry" };
+    return offlineMeta(id, `Dealer ${id}`, "", "unreachable", false);
   }
 
-  const wanted = (params.dealerIds ?? []).map(String).filter(Boolean);
-  const selected = wanted.length ? roster.filter((d) => wanted.includes(String(d.dealer_id))) : roster;
-
-  const results = await Promise.allSettled(selected.map((dealer) => fetchDealerReport(dealer, windowDays, includeZero)));
-
-  const dealers: DealerStatus[] = [];
-  const rows: InventoryRow[] = [];
-  const stockOuts: StockOutItem[] = [];
-
-  results.forEach((result, index) => {
-    const dealer = selected[index];
-    const dealerId = String(dealer.dealer_id);
-    const dealerName = str(dealer.dealer_name) || `Dealer ${dealerId}`;
-    if (result.status === "rejected") {
-      console.error(`ERR_API_FAIL: [InventoryReport] Dealer "${dealerName}" is offline:`, result.reason);
-      dealers.push({
-        dealerId,
-        dealerName,
-        dealerCode: str(dealer.dealer_code),
+  const dealer = findDealer(roster, id);
+  if (!dealer) {
+    console.error(`ERR_NOT_FOUND: [InventoryReport] Dealer "${id}" is not on the roster`);
+    return {
+      success: false,
+      dealer: {
+        dealerId: id,
+        dealerName: `Dealer ${id}`,
+        dealerCode: "",
         online: false,
         rowCount: 0,
-        error: "Dealer backend unreachable",
+        error: "Unknown dealer",
         reason: "unreachable",
-      });
-      return;
-    }
-    dealers.push(result.value.status);
-    rows.push(...result.value.rows);
-    stockOuts.push(...result.value.stockOuts);
+      },
+      branches: [],
+      products: [],
+      totalBranches: 0,
+      branchPageSize: BRANCH_PAGE_SIZE,
+      error: "Unknown dealer",
+    };
+  }
+
+  const dealerName = str(dealer.dealer_name) || `Dealer ${id}`;
+  const dealerCode = str(dealer.dealer_code);
+  const springBase = str(dealer.springboot).replace(/\/+$/, "");
+  const directusBase = str(dealer.directus).replace(/\/+$/, "");
+  if (!springBase || !directusBase) {
+    return offlineMeta(id, dealerName, dealerCode, "unreachable", false);
+  }
+
+  // Login first: without a Spring token no stock page can load, so fail fast
+  // with the credential reason instead of shipping a master nobody can page.
+  const login = await getSpringToken(springBase, opts?.refresh === true);
+  if (!login.ok) {
+    return offlineMeta(id, dealerName, dealerCode, login.reason, false);
+  }
+
+  let ctx: DealerContext;
+  try {
+    ctx = await ensureDealerContext(dealer, { refresh: opts?.refresh });
+  } catch (err) {
+    console.error(`ERR_API_FAIL: [InventoryReport] Dealer "${dealerName}" master unreachable:`, err);
+    const failure = classifyStockError(err);
+    return offlineMeta(
+      id,
+      dealerName,
+      dealerCode,
+      failure === "timeout" ? "timeout" : "product-master-unreachable",
+      false,
+    );
+  }
+
+  return {
+    success: true,
+    dealer: { dealerId: id, dealerName, dealerCode, online: true, rowCount: 0 },
+    branches: ctx.branches,
+    products: ctx.products,
+    totalBranches: ctx.branches.length,
+    branchPageSize: BRANCH_PAGE_SIZE,
+  };
+}
+
+/**
+ * Loads one branch-batch of stock rows for a dealer and joins cost, reorder
+ * floor and trailing demand onto each row. Zero rows are dropped unless
+ * `includeZero` is set. Page payloads are cached for 3 min per
+ * dealer/page/size/window/zero-flags unless `bypassCache` is set.
+ */
+export async function fetchInventoryPage(
+  dealerId: string,
+  page: number,
+  pageSize: number,
+  opts?: { windowDays?: number; includeZero?: boolean; bypassCache?: boolean },
+): Promise<InventoryPageResponse> {
+  const id = str(dealerId);
+  const safePage = Number.isFinite(page) ? Math.max(0, Math.trunc(page)) : 0;
+  const safeSize = normalizePageSize(pageSize);
+  const windowDays = normalizeWindowDays(opts?.windowDays ?? 30);
+  const includeZero = opts?.includeZero === true;
+
+  const empty = (totalBranches: number, branchIds: number[], error?: string): InventoryPageResponse => ({
+    success: error === undefined,
+    dealerId: id,
+    page: safePage,
+    pageSize: safeSize,
+    totalBranches,
+    branchIds,
+    hasMore: false,
+    scanned: 0,
+    rows: [],
+    error,
   });
 
-  return { ...empty, dealers, rows, stockOuts };
+  if (!UPSTREAM) {
+    console.error("ERR_CONFIG: [InventoryReport] NEXT_PUBLIC_API_BASE_URL is not defined");
+    return empty(0, [], "Server configuration error");
+  }
+
+  const cacheKey =
+    `inventory-report:page:${id}:${safePage}:${safeSize}:${windowDays}:${includeZero ? 1 : 0}`;
+  if (!opts?.bypassCache) {
+    const hit = dealeroverCache.get<InventoryPageResponse>(cacheKey);
+    if (hit) return hit;
+  }
+
+  let roster: DealerRow[];
+  try {
+    roster = await getCachedDealerList();
+  } catch (error) {
+    console.error("ERR_API_FAIL: [InventoryReport] Failed to load dealer roster:", error);
+    return empty(0, [], "Unable to reach the dealer registry");
+  }
+
+  const dealer = findDealer(roster, id);
+  if (!dealer) {
+    console.error(`ERR_NOT_FOUND: [InventoryReport] Dealer "${id}" is not on the roster`);
+    return empty(0, [], "Unknown dealer");
+  }
+
+  const dealerName = str(dealer.dealer_name) || `Dealer ${id}`;
+  const dealerCode = str(dealer.dealer_code);
+  const springBase = str(dealer.springboot).replace(/\/+$/, "");
+  const directusBase = str(dealer.directus).replace(/\/+$/, "");
+  if (!springBase || !directusBase) {
+    return empty(0, [], DEALER_FAILURE_MESSAGES["unreachable"]);
+  }
+
+  let ctx: DealerContext;
+  try {
+    ctx = await ensureDealerContext(dealer);
+  } catch (err) {
+    console.error(`ERR_API_FAIL: [InventoryReport] Dealer "${dealerName}" master unreachable:`, err);
+    return empty(0, [], DEALER_FAILURE_MESSAGES["product-master-unreachable"]);
+  }
+
+  const totalBranches = ctx.branches.length;
+  const slice = ctx.branches.slice(safePage * safeSize, safePage * safeSize + safeSize);
+  const branchIds = slice.map((b) => b.branchId);
+  if (branchIds.length === 0) {
+    return { ...empty(totalBranches, []), success: true };
+  }
+
+  const stock = await fetchStockForBranches(springBase, branchIds);
+  if (!stock.ok) {
+    console.error(
+      `ERR_API_FAIL: [InventoryReport] Dealer "${dealerName}" page ${safePage} failed: ${stock.reason}${stock.detail ? ` (${stock.detail})` : ""}`,
+    );
+    return empty(
+      totalBranches,
+      branchIds,
+      `${DEALER_FAILURE_MESSAGES[stock.reason]}${stock.detail ? ` (${stock.detail})` : ""}`,
+    );
+  }
+
+  const headers = dealerHeaders(dealer);
+  const settled = await Promise.allSettled([
+    getCachedCollection<RawInvoice>(
+      `inventory-report:${id}:invoices`,
+      `${directusBase}/items/sales_invoice?limit=-1&fields=${SALES_INVOICE_FIELDS}`,
+      headers,
+    ),
+    getCachedCollection<RawInvoiceDetail>(
+      `inventory-report:${id}:invoice-lines`,
+      `${directusBase}/items/sales_invoice_details?limit=-1&fields=${SALES_DETAIL_FIELDS}`,
+      headers,
+    ),
+    getCachedCollection<RawSupplier>(
+      `inventory-report:${id}:suppliers`,
+      `${directusBase}/items/suppliers?limit=-1&fields=${SUPPLIER_FIELDS}`,
+      headers,
+    ),
+  ]);
+  const invoices = settled[0].status === "fulfilled" ? settled[0].value : [];
+  const invoiceLines = settled[1].status === "fulfilled" ? settled[1].value : [];
+  const suppliers = settled[2].status === "fulfilled" ? settled[2].value : [];
+
+  const productById = new Map<number, MasterProduct>();
+  for (const p of ctx.products) {
+    if (!productById.has(p.productId)) productById.set(p.productId, p);
+  }
+  const branchNameById = new Map<number, string>();
+  for (const b of ctx.branches) branchNameById.set(b.branchId, b.branchName);
+  const supplierShortcutById = new Map<number, string>();
+  for (const s of suppliers) {
+    const sid = toInt(s.id);
+    if (sid > 0) supplierShortcutById.set(sid, str(s.supplier_shortcut));
+  }
+
+  // Demand basis: the dealer's own invoices over the trailing window.
+  const windowStart = Date.now() - Math.max(windowDays, 1) * 24 * 60 * 60 * 1000;
+  const packById = new Map<number, number>();
+  for (const p of ctx.products) {
+    if (p.unitCount > 0) packById.set(p.productId, p.unitCount);
+  }
+  const demandByKey = buildDemandByKey(invoices, invoiceLines, packById, windowStart);
+
+  const rows: InventoryRow[] = [];
+  for (const raw of stock.rows) {
+    const running = toNum(raw.runningInventory);
+    if (running <= 0 && !includeZero) continue;
+    const productId = toInt(raw.productId);
+    const branchId = toInt(raw.branchId);
+    if (productId <= 0 || branchId <= 0) continue;
+    const master = productById.get(productId);
+    const rawUnitCount = toNum(raw.unitCount);
+    const unitCount = rawUnitCount > 0 ? rawUnitCount : (master?.unitCount ?? 0);
+    const rawShortcut = str(raw.supplierShortcut);
+    const fallbackShortcut = supplierShortcutById.get(toInt(raw.supplierId)) ?? "";
+
+    rows.push({
+      key: `${id}:${str(raw.id) || `${branchId}-${productId}`}`,
+      dealerId: id,
+      dealerName,
+      dealerCode,
+      branchId,
+      branchName: str(raw.branchName) || branchNameById.get(branchId) || `Branch ${branchId}`,
+      productId,
+      productCode: str(raw.productCode),
+      productName: str(raw.productName),
+      productBarcode: str(raw.productBarcode),
+      productBrand: str(raw.productBrand) || master?.brand || "",
+      productCategory: str(raw.productCategory) || master?.category || "",
+      supplierShortcut: rawShortcut || fallbackShortcut,
+      unitName: str(raw.unitName),
+      unitCount,
+      onHand: running,
+      lastCount: toNum(raw.lastCount),
+      movementAfter: toNum(raw.movementAfter),
+      lastCutoff: str(raw.lastCutoff),
+      costPerUnit: master?.costPerUnit ?? 0,
+      maintainingQuantity: master?.maintainingQuantity ?? 0,
+      demandQty: demandByKey.get(`${productId}:${branchId}`) ?? 0,
+    });
+  }
+
+  const response: InventoryPageResponse = {
+    success: true,
+    dealerId: id,
+    page: safePage,
+    pageSize: safeSize,
+    totalBranches,
+    branchIds,
+    hasMore: (safePage + 1) * safeSize < totalBranches,
+    scanned: stock.rows.length,
+    rows,
+  };
+  if (!opts?.bypassCache) {
+    dealeroverCache.set(cacheKey, response, PAGE_CACHE_TTL_MS);
+  }
+  return response;
 }

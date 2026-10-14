@@ -35,9 +35,9 @@ export function PolicyPanel({
   return (
     <Popover>
       <PopoverTrigger asChild>
-        <Button variant="outline" size="sm" className="h-8 gap-2 text-xs" aria-label="Low-stock policy">
+        <Button variant="outline" size="sm" className="h-8 gap-2 text-xs min-h-11 md:min-h-0" aria-label="Low-stock threshold policy">
           <Settings2 className="size-4" />
-          <span className="hidden sm:inline">Policy</span>
+          <span className="hidden sm:inline">Thresholds</span>
         </Button>
       </PopoverTrigger>
       <PopoverContent align="end" className="w-80 p-4">
@@ -54,12 +54,12 @@ export function PolicyPanel({
                   onClick={() => onBasis(basis)}
                   aria-pressed={policy.basis === basis}
                 >
-                  {basis === "policy" ? "Policy" : "Product maintain"}
+                  {basis === "policy" ? "Threshold" : "Maintain"}
                 </Button>
               ))}
             </div>
             <p className="mt-1 text-[11px] leading-snug text-muted-foreground">
-              Maintain uses each product&apos;s master quantity when set, otherwise the policy values below.
+              Maintain uses each product&apos;s master quantity when set, otherwise the threshold values below.
             </p>
           </div>
 

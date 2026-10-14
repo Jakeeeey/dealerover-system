@@ -1,263 +1,261 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { toast } from "sonner";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
+  DealerBranch,
   DealerRosterEntry,
   DealerStatus,
-  InventoryReportResponse,
+  InventoryProgress,
   InventoryRow,
+  MasterProduct,
   StockOutItem,
 } from "../types";
 import {
+  BRANCH_PAGE_SIZE,
   getDealerRoster,
-  getInventoryReport,
-  type InventoryReportQuery,
+  getInventoryMeta,
+  getInventoryPage,
 } from "../providers/inventory-report-provider";
 
-function toUserMessage(message: string): string {
-  return message.replace(/^[A-Z][A-Z0-9_]*:\s*/, "");
+export type { InventoryProgress };
+
+export interface InventoryReportQuery {
+  dealerId: string | null;
+  includeZero: boolean;
+  windowDays: number;
 }
 
-export interface DealerFetchState {
-  loading: boolean;
-  online: boolean;
-  reason?: string;
-  rowCount: number;
-}
-
-interface DealerBucket {
-  status: DealerStatus | null;
+export interface InventoryReportResult {
+  roster: DealerRosterEntry[] | null;
+  rosterLoading: boolean;
+  dealer: DealerStatus | null;
+  branches: DealerBranch[];
+  products: MasterProduct[];
   rows: InventoryRow[];
   stockOuts: StockOutItem[];
+  progress: InventoryProgress;
+  /** True only while branch pages are landing; a failed page ends the stream. */
+  streaming: boolean;
+  isLoading: boolean;
+  error: string | null;
+  generatedAt: string;
+  windowDays: number;
+  includeZero: boolean;
+  refresh: (opts?: { bypassCache?: boolean }) => void;
 }
 
-function offlineStatus(
-  dealerId: string,
-  roster: DealerRosterEntry[],
-  reason: string,
-  message: string,
-): DealerStatus {
-  const entry = roster.find((r) => r.dealerId === dealerId);
-  return {
-    dealerId,
-    dealerName: entry?.dealerName ?? `Dealer ${dealerId}`,
-    dealerCode: entry?.dealerCode ?? "",
-    online: false,
-    rowCount: 0,
-    error: message,
-    reason,
-  };
+const EMPTY_PROGRESS: InventoryProgress = { pagesDone: 0, totalPages: 0, scanned: 0, plotted: 0 };
+
+function isAbort(err: unknown): boolean {
+  return err instanceof DOMException && err.name === "AbortError";
+}
+
+function messageOf(err: unknown, fallback: string): string {
+  return err instanceof Error ? err.message : fallback;
 }
 
 /**
- * Loads the HQ inventory report progressively — one request per dealer fired
- * in parallel, merged as each resolves. Loaded dealers stay visible while a
- * slow dealer (e.g. Men2 Dagupan) is still pending; a failing dealer keeps
- * its own reason and never affects the others. Previous data is kept on
- * filter changes until each dealer's new response replaces it
- * (stale-while-revalidate), and a request-sequence guard drops out-of-order
- * responses so a slow earlier wave cannot overwrite newer data.
+ * Loads one dealer's inventory progressively: roster once, then the dealer
+ * meta (branches + product master), then one branch-batch page at a time,
+ * merging rows as each lands. A wave/generation counter plus a per-wave
+ * AbortController guarantees a dealer switch can never be overwritten by an
+ * older page response. Failures land in `error` and are never thrown.
  */
-export function useInventoryReport(query: InventoryReportQuery) {
+export function useInventoryReport(query: InventoryReportQuery): InventoryReportResult {
+  const { dealerId: wantedDealerId, includeZero, windowDays } = query;
+
   const [roster, setRoster] = useState<DealerRosterEntry[] | null>(null);
   const [rosterLoading, setRosterLoading] = useState(true);
-  const [buckets, setBuckets] = useState<Record<string, DealerBucket>>({});
-  const [dealerStates, setDealerStates] = useState<Record<string, DealerFetchState>>({});
-  const [generatedAt, setGeneratedAt] = useState(() => new Date().toISOString());
-  const [waveParams, setWaveParams] = useState({ windowDays: query.windowDays, includeZero: query.includeZero });
+  const [dealer, setDealer] = useState<DealerStatus | null>(null);
+  const [branches, setBranches] = useState<DealerBranch[]>([]);
+  const [products, setProducts] = useState<MasterProduct[]>([]);
+  const [rows, setRows] = useState<InventoryRow[]>([]);
+  const [progress, setProgress] = useState<InventoryProgress>(EMPTY_PROGRESS);
+  const [metaLoading, setMetaLoading] = useState(false);
+  const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [tick, setTick] = useState(0);
+  const [generatedAt, setGeneratedAt] = useState(() => new Date().toISOString());
+  const [wave, setWave] = useState({ n: 0, bypassCache: false });
+  const generationRef = useRef(0);
 
-  // Serialize the id list so the effect fires on filter changes, not renders.
-  const dealerIdsKey = useMemo(() => [...query.dealerIds].sort().join(","), [query.dealerIds]);
-  const { includeZero, windowDays } = query;
+  // Roster is fetched once per mount; the first slot is the default dealer.
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      try {
+        const loaded = await getDealerRoster();
+        if (!cancelled) setRoster(loaded);
+      } catch (err: unknown) {
+        if (!cancelled) setError(messageOf(err, "Failed to load the dealer roster"));
+      } finally {
+        if (!cancelled) setRosterLoading(false);
+      }
+    }
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
-  const refresh = useCallback(() => {
-    setTick((t) => t + 1);
+  // Roster order IS the slot order — the first slot is the default.
+  // An empty string means "no explicit choice": fall back to the first slot.
+  const effectiveDealerId =
+    (wantedDealerId && wantedDealerId.trim().length > 0 ? wantedDealerId : null) ??
+    roster?.[0]?.dealerId ??
+    null;
+
+  const refresh = useCallback((opts?: { bypassCache?: boolean }) => {
+    // Invalidate any in-flight wave immediately, clear rows first, then let
+    // the wave effect below re-run with (or without) cache bypass.
+    generationRef.current += 1;
+    setRows([]);
+    setProgress(EMPTY_PROGRESS);
+    setError(null);
+    setWave((w) => ({ n: w.n + 1, bypassCache: opts?.bypassCache === true }));
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    const controllers = new Map<string, AbortController>();
+    if (!effectiveDealerId) return;
+    const dealerId = effectiveDealerId;
+    const generation = generationRef.current + 1;
+    generationRef.current = generation;
+    const controller = new AbortController();
+
+    // Dealer/filter change: reset rows, then load meta, then stream pages.
+    setRows([]);
+    setProgress(EMPTY_PROGRESS);
+    setError(null);
+    setDealer(null);
+    setBranches([]);
+    setProducts([]);
+    setMetaLoading(true);
+    setStreaming(false);
 
     async function run() {
-      // Roster first (fetched once per session — the route serves it from the
-      // already-cached dealer list), so the picker never depends on selection.
-      let currentRoster = roster;
-      if (!currentRoster) {
-        setRosterLoading(true);
-        try {
-          const loaded = await getDealerRoster();
-          if (cancelled) return;
-          currentRoster = loaded;
-          setRoster(loaded);
-        } catch (err: unknown) {
-          if (cancelled) return;
-          const message = err instanceof Error ? err.message : "Failed to load the dealer roster";
-          setError((prev) => prev ?? message);
-          toast.error("Dealer roster failed", { description: toUserMessage(message) });
-        } finally {
-          if (!cancelled) setRosterLoading(false);
-        }
-      } else {
-        setRosterLoading(false);
-      }
-      if (cancelled) return;
-
-      const wanted = dealerIdsKey ? dealerIdsKey.split(",") : [];
-      // Empty selection = every roster dealer, as explicit per-dealer
-      // requests (never one combined call that a slow dealer would block).
-      const rosterIds = (currentRoster ?? []).map((r) => r.dealerId);
-      const targets = wanted.length ? wanted : rosterIds;
-      const rosterSnapshot = currentRoster ?? [];
-
-      setWaveParams({ windowDays, includeZero });
-      setGeneratedAt(new Date().toISOString());
-      if (!cancelled) setError(null);
-
-      // Drop dealers that are no longer selected; keep everyone else's data
-      // visible while their refresh is in flight.
-      setBuckets((prev) => {
-        const next: Record<string, DealerBucket> = {};
-        for (const id of targets) {
-          next[id] = prev[id] ?? { status: null, rows: [], stockOuts: [] };
-        }
-        return next;
-      });
-      setDealerStates((prev) => {
-        const next: Record<string, DealerFetchState> = {};
-        for (const id of targets) {
-          const old = prev[id];
-          next[id] = {
-            loading: true,
-            online: old?.online ?? true,
-            reason: old?.reason,
-            rowCount: old?.rowCount ?? 0,
-          };
-        }
-        return next;
-      });
-
-      // No resolvable target (roster failed and nothing selected): fall back
-      // to one combined request so the page still shows something.
-      const waves = targets.length
-        ? targets.map((id) => ({ id, params: { dealerIds: [id], includeZero, windowDays } }))
-        : [{ id: "", params: { dealerIds: [] as string[], includeZero, windowDays } }];
-
-      const settle = (id: string, response: InventoryReportResponse) => {
-        if (cancelled) return;
-        setGeneratedAt(response.generatedAt);
-        if (!id) {
-          // Combined fallback: split rows back out per dealer.
-          setBuckets(() => {
-            const next: Record<string, DealerBucket> = {};
-            for (const status of response.dealers) {
-              next[status.dealerId] = {
-                status,
-                rows: response.rows.filter((r) => r.dealerId === status.dealerId),
-                stockOuts: response.stockOuts.filter((s) => s.dealerId === status.dealerId),
-              };
-            }
-            return next;
-          });
-          setDealerStates(() => {
-            const next: Record<string, DealerFetchState> = {};
-            for (const status of response.dealers) {
-              next[status.dealerId] = {
-                loading: false,
-                online: status.online,
-                reason: status.reason,
-                rowCount: status.rowCount,
-              };
-            }
-            return next;
-          });
-          return;
-        }
-        const status =
-          response.dealers.find((d) => d.dealerId === id) ??
-          ({
-            dealerId: id,
-            dealerName: rosterSnapshot.find((r) => r.dealerId === id)?.dealerName ?? `Dealer ${id}`,
-            dealerCode: rosterSnapshot.find((r) => r.dealerId === id)?.dealerCode ?? "",
-            online: true,
-            rowCount: response.rows.length,
-          } satisfies DealerStatus);
-        const rows = response.rows.filter((r) => r.dealerId === id);
-        const stockOuts = response.stockOuts.filter((s) => s.dealerId === id);
-        setBuckets((prev) => ({ ...prev, [id]: { status, rows, stockOuts } }));
-        setDealerStates((prev) => ({
-          ...prev,
-          [id]: { loading: false, online: status.online, reason: status.reason, rowCount: rows.length },
-        }));
-      };
-
-      const fail = (id: string, err: unknown) => {
-        if (cancelled) return;
-        if (err instanceof DOMException && err.name === "AbortError") return;
-        const message = err instanceof Error ? err.message : "Dealer backend unreachable";
-        if (!id) {
-          setError(message);
-          toast.error("Inventory report failed", { description: toUserMessage(message) });
-          return;
-        }
-        // Keep this dealer's previous rows on screen; record its own reason.
-        setBuckets((prev) => {
-          const old = prev[id];
-          if (old?.status) return prev;
-          return { ...prev, [id]: { status: offlineStatus(id, rosterSnapshot, "unreachable", message), rows: [], stockOuts: [] } };
+      let meta;
+      try {
+        meta = await getInventoryMeta(dealerId, {
+          refresh: wave.bypassCache,
+          signal: controller.signal,
         });
-        setDealerStates((prev) => ({
-          ...prev,
-          [id]: { loading: false, online: false, reason: "unreachable", rowCount: prev[id]?.rowCount ?? 0 },
-        }));
-      };
+      } catch (err: unknown) {
+        if (generation !== generationRef.current) return;
+        if (isAbort(err)) return;
+        setMetaLoading(false);
+        setError(messageOf(err, "Failed to load dealer inventory"));
+        return;
+      }
+      // An older wave's meta must never overwrite the current dealer.
+      if (generation !== generationRef.current) return;
+      setMetaLoading(false);
+      setGeneratedAt(new Date().toISOString());
+      setDealer(meta.dealer);
+      setBranches(meta.branches);
+      setProducts(meta.products);
 
-      await Promise.all(
-        waves.map(async ({ id, params }) => {
-          const controller = new AbortController();
-          if (id) controllers.set(id, controller);
-          try {
-            const response = await getInventoryReport(params, controller.signal);
-            settle(id, response);
-          } catch (err: unknown) {
-            fail(id, err);
-          }
-        }),
-      );
+      if (!meta.success || !meta.dealer.online) {
+        setError(meta.dealer.error ?? meta.error ?? "Dealer offline");
+        return;
+      }
+
+      const pageSize = meta.branchPageSize > 0 ? meta.branchPageSize : BRANCH_PAGE_SIZE;
+      const totalPages = Math.ceil(meta.totalBranches / pageSize);
+      setProgress({ ...EMPTY_PROGRESS, totalPages });
+      if (totalPages === 0) return;
+
+      setStreaming(true);
+      const merged: InventoryRow[] = [];
+      let scanned = 0;
+      for (let page = 0; page < totalPages; page += 1) {
+        let res;
+        try {
+          res = await getInventoryPage(dealerId, page, pageSize, {
+            windowDays,
+            includeZero,
+            refresh: wave.bypassCache,
+            signal: controller.signal,
+          });
+        } catch (err: unknown) {
+          if (generation !== generationRef.current) return;
+          if (isAbort(err)) return;
+          setError(messageOf(err, "Failed to load inventory page"));
+          break;
+        }
+        // An older wave's page must never merge into the current dealer.
+        if (generation !== generationRef.current) return;
+        if (!res.success) {
+          setError(res.error ?? "Failed to load inventory page");
+          break;
+        }
+        merged.push(...res.rows);
+        scanned += res.scanned;
+        const landed = [...merged];
+        setRows(landed);
+        setProgress({ pagesDone: page + 1, totalPages, scanned, plotted: landed.length });
+        if (!res.hasMore) break;
+      }
+      if (generation !== generationRef.current) return;
+      setStreaming(false);
     }
 
     void run();
 
     return () => {
-      cancelled = true;
-      for (const controller of controllers.values()) controller.abort();
+      controller.abort();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dealerIdsKey, includeZero, windowDays, tick]);
+    // Wave inputs: effective dealer, filters, and the refresh counter.
+  }, [effectiveDealerId, windowDays, includeZero, wave]);
 
-  const data = useMemo<InventoryReportResponse | null>(() => {
-    const statuses = Object.values(buckets)
-      .map((b) => b.status)
-      .filter((s): s is DealerStatus => s !== null);
-    if (!statuses.length) return null;
-    return {
-      success: true,
-      generatedAt,
-      windowDays: waveParams.windowDays,
-      includeZero: waveParams.includeZero,
-      dealers: statuses,
-      rows: Object.values(buckets).flatMap((b) => b.rows),
-      stockOuts: Object.values(buckets).flatMap((b) => b.stockOuts),
-      roster: roster ?? undefined,
-    };
-  }, [buckets, generatedAt, waveParams, roster]);
+  // Every master product whose summed on-hand across streamed rows is zero.
+  const stockOuts = useMemo<StockOutItem[]>(() => {
+    if (!dealer || !dealer.online || products.length === 0) return [];
+    // Only meaningful once every branch page has landed: while pages are still
+    // streaming, a product whose stock has not arrived yet would read as OUT.
+    const complete = progress.totalPages > 0 && progress.pagesDone === progress.totalPages;
+    if (!complete) return [];
+    const onHandByProduct = new Map<number, number>();
+    const branchIds = new Set<number>();
+    for (const row of rows) {
+      branchIds.add(row.branchId);
+      onHandByProduct.set(row.productId, (onHandByProduct.get(row.productId) ?? 0) + row.onHand);
+    }
+    const branchCount = branchIds.size;
+    const out: StockOutItem[] = [];
+    for (const p of products) {
+      if ((onHandByProduct.get(p.productId) ?? 0) !== 0) continue;
+      out.push({
+        key: `${dealer.dealerId}:stockout:${p.productId}`,
+        dealerId: dealer.dealerId,
+        dealerName: dealer.dealerName,
+        productId: p.productId,
+        productCode: p.productCode,
+        productName: p.productName,
+        brand: p.brand,
+        category: p.category,
+        costPerUnit: p.costPerUnit,
+        branchCount,
+      });
+    }
+    return out;
+  }, [dealer, products, rows, progress.pagesDone, progress.totalPages]);
 
-  // Initial roster / first responses still pending — NOT "any dealer loading".
-  const isLoading =
-    rosterLoading ||
-    (data === null && Object.values(dealerStates).some((s) => s.loading));
+  const isLoading = rosterLoading || metaLoading || streaming;
 
-  return { data, isLoading, error, refresh, dealerStates };
+  return {
+    roster,
+    rosterLoading,
+    streaming,
+    dealer,
+    branches,
+    products,
+    rows,
+    stockOuts,
+    progress,
+    isLoading,
+    error,
+    generatedAt,
+    windowDays,
+    includeZero,
+    refresh,
+  };
 }

@@ -5,8 +5,9 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { cn, formatCurrency, formatNumber } from "@/lib/utils";
 
 interface HeroBandProps {
-  dealersOnline: number;
-  dealersTotal: number;
+  dealerName: string;
+  dealerCode: string;
+  online: boolean;
   skusTracked: number;
   outCount: number;
   criticalCount: number;
@@ -18,17 +19,21 @@ const VALUE_FORMULA = "Value = (pieces ÷ pieces-per-display-unit) × cost-per-d
 
 const MICRO_LABEL = "text-[11px] font-medium uppercase tracking-wider text-muted-foreground";
 
+/**
+ * Single-dealer hero band — carries the scoped dealer's identity (name, code,
+ * online state) plus that dealer's headline counts. Visible in both the
+ * dashboard and the drill-table views.
+ */
 export function HeroBand({
-  dealersOnline,
-  dealersTotal,
+  dealerName,
+  dealerCode,
+  online,
   skusTracked,
   outCount,
   criticalCount,
   lowCount,
   totalValue,
 }: HeroBandProps) {
-  const degraded = dealersOnline < dealersTotal;
-
   return (
     <section
       aria-label="Inventory overview"
@@ -40,14 +45,15 @@ export function HeroBand({
         <div className="min-w-0">
           <h2 className="truncate text-xl font-bold tracking-tight sm:text-2xl">Inventory Report</h2>
           <p className="truncate text-sm text-muted-foreground">
-            Low-stock signals across every dealer — demand cover, minimums, and value at risk.
+            {dealerName || "No dealer selected"}
+            {dealerCode ? ` · ${dealerCode}` : ""} — low-stock signals, demand cover, and value at risk.
           </p>
         </div>
       </div>
 
       <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:gap-6">
         <div className="min-w-0 sm:text-right">
-          <p className={MICRO_LABEL}>Network inventory value</p>
+          <p className={MICRO_LABEL}>Dealer inventory value</p>
           <TooltipProvider>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -67,12 +73,11 @@ export function HeroBand({
             <p className="flex items-center gap-1.5 text-sm font-semibold tabular-nums">
               <span
                 aria-hidden
-                className={cn("size-2 shrink-0 animate-pulse rounded-full", degraded ? "bg-warning" : "bg-success")}
+                className={cn("size-2 shrink-0 animate-pulse rounded-full", online ? "bg-success" : "bg-warning")}
               />
-              {formatNumber(dealersOnline, "en-PH", 0)}/{formatNumber(dealersTotal, "en-PH", 0)}
-              <StatusBadge tone={degraded ? "warning" : "success"}>{degraded ? "Degraded" : "Online"}</StatusBadge>
+              <StatusBadge tone={online ? "success" : "warning"}>{online ? "Online" : "Offline"}</StatusBadge>
             </p>
-            <p className={MICRO_LABEL}>Dealers online</p>
+            <p className={MICRO_LABEL}>Dealer status</p>
           </div>
           <div className="min-w-0">
             <p className="text-sm font-semibold tabular-nums text-destructive">

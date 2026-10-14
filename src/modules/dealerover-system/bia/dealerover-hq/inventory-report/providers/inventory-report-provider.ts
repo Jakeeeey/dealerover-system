@@ -1,56 +1,41 @@
+import { z } from "zod";
 import {
   DealerRosterEntrySchema,
-  InventoryReportResponseSchema,
+  InventoryMetaResponseSchema,
+  InventoryPageResponseSchema,
   type DealerRosterEntry,
-  type InventoryReportResponse,
+  type InventoryMetaResponse,
+  type InventoryPageResponse,
 } from "../types";
 
 const API_PATH = "/api/dealerover-system/bia/dealerover-hq/inventory-report";
 
-export interface InventoryReportQuery {
-  dealerIds: string[];
-  includeZero: boolean;
-  windowDays: number;
-}
+/**
+ * Client-safe fallback branch-batch size. Callers prefer
+ * `meta.branchPageSize` when a meta payload is in hand.
+ */
+export const BRANCH_PAGE_SIZE = 10;
+
+const RosterResponseSchema = z.object({
+  success: z.boolean(),
+  roster: z.array(DealerRosterEntrySchema),
+});
 
 function errorMessage(payload: unknown, fallback: string): string {
   const record = payload as { message?: string; error?: string } | null;
   return record?.message ?? record?.error ?? fallback;
 }
 
-/**
- * Client fetch helper for the HQ inventory report. Calls the local API proxy
- * (which injects the server-only tokens) and validates the envelope.
- */
-export async function getInventoryReport(
-  query: InventoryReportQuery,
-  signal?: AbortSignal,
-): Promise<InventoryReportResponse> {
-  const params = new URLSearchParams();
-  for (const id of query.dealerIds) params.append("dealerIds", id);
-  params.set("includeZero", query.includeZero ? "1" : "0");
-  params.set("windowDays", String(query.windowDays));
-
-  const res = await fetch(`${API_PATH}?${params.toString()}`, {
-    method: "GET",
-    headers: { "Content-Type": "application/json" },
-    cache: "no-store",
-    signal,
-  });
-
-  const payload: unknown = await res.json().catch(() => null);
-
-  if (!res.ok) {
-    throw new Error(errorMessage(payload, "Failed to load the inventory report"));
-  }
-
-  const envelope = payload as { success?: boolean; data?: unknown };
-  return InventoryReportResponseSchema.parse(envelope.data ?? payload);
+async function readPayload(res: Response): Promise<unknown> {
+  return res.json().catch(() => null);
 }
 
 /**
- * Lightweight dealer roster for the picker. Never depends on the selected
- * dealers, so the filter options stay stable while per-dealer data streams in.
+ * Client fetch helpers for the HQ inventory report. Calls the local API proxy
+ * (which injects the server-only tokens) and validates every response
+ * against the frozen zod schemas. Transport-level failures throw; a dealer
+ * that is offline rides inside its schema payload (with `success: false`
+ * plus `dealer.reason` / `error`) and does not throw.
  */
 export async function getDealerRoster(signal?: AbortSignal): Promise<DealerRosterEntry[]> {
   const res = await fetch(`${API_PATH}?roster=1`, {
@@ -60,14 +45,86 @@ export async function getDealerRoster(signal?: AbortSignal): Promise<DealerRoste
     signal,
   });
 
-  const payload: unknown = await res.json().catch(() => null);
+  const payload = await readPayload(res);
 
   if (!res.ok) {
     throw new Error(errorMessage(payload, "Failed to load the dealer roster"));
   }
 
-  const envelope = payload as { success?: boolean; data?: unknown };
-  const parsed = InventoryReportResponseSchema.parse(envelope.data ?? payload);
-  const roster = (parsed.roster ?? []).map((entry) => DealerRosterEntrySchema.parse(entry));
-  return roster;
+  const parsed = RosterResponseSchema.parse(payload);
+  if (!parsed.success) {
+    throw new Error(errorMessage(payload, "Failed to load the dealer roster"));
+  }
+  return parsed.roster;
+}
+
+/**
+ * Loads one dealer's branches plus its whole active product master. Carries
+ * no stock rows — page those with {@link getInventoryPage}.
+ */
+export async function getInventoryMeta(
+  dealerId: string,
+  opts?: { refresh?: boolean; signal?: AbortSignal },
+): Promise<InventoryMetaResponse> {
+  const params = new URLSearchParams();
+  params.set("dealerId", dealerId);
+  params.set("meta", "1");
+  if (opts?.refresh === true) params.set("refresh", "1");
+
+  const res = await fetch(`${API_PATH}?${params.toString()}`, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+    cache: "no-store",
+    signal: opts?.signal,
+  });
+
+  const payload = await readPayload(res);
+
+  if (!res.ok) {
+    throw new Error(errorMessage(payload, "Failed to load dealer inventory"));
+  }
+
+  return InventoryMetaResponseSchema.parse(payload);
+}
+
+export interface InventoryPageQuery {
+  windowDays: number;
+  includeZero: boolean;
+  refresh?: boolean;
+  signal?: AbortSignal;
+}
+
+/**
+ * Loads one branch-batch of stock rows for a dealer. The backend cannot page
+ * natively, so `page`/`pageSize` slice the dealer's branch list and each
+ * response reports whether more branches remain via `hasMore`.
+ */
+export async function getInventoryPage(
+  dealerId: string,
+  page: number,
+  pageSize: number,
+  query: InventoryPageQuery,
+): Promise<InventoryPageResponse> {
+  const params = new URLSearchParams();
+  params.set("dealerId", dealerId);
+  params.set("page", String(page));
+  params.set("pageSize", String(pageSize));
+  params.set("windowDays", String(query.windowDays));
+  params.set("includeZero", query.includeZero ? "1" : "0");
+  if (query.refresh === true) params.set("refresh", "1");
+
+  const res = await fetch(`${API_PATH}?${params.toString()}`, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+    cache: "no-store",
+    signal: query.signal,
+  });
+
+  const payload = await readPayload(res);
+
+  if (!res.ok) {
+    throw new Error(errorMessage(payload, "Failed to load inventory page"));
+  }
+
+  return InventoryPageResponseSchema.parse(payload);
 }

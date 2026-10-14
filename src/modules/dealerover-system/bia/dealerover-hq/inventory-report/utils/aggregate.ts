@@ -1,4 +1,4 @@
-import type { InventoryRow, LowStockPolicy, LowStockState } from "../types";
+import type { BranchKind, DealerBranch, InventoryRow, LowStockPolicy, LowStockState } from "../types";
 import {
   computeSeverity,
   effectiveMinPieces,
@@ -16,6 +16,7 @@ export interface ProductAggregate {
   productName: string;
   brand: string;
   category: string;
+  supplier: string;
   unitName: string;
   unitCount: number;
   costPerUnit: number;
@@ -118,6 +119,7 @@ export function buildProductAggregates(rows: InventoryRow[], policy: LowStockPol
       productName: p.first.productName,
       brand: p.first.productBrand,
       category: p.first.productCategory,
+      supplier: p.first.supplierShortcut,
       unitName: p.first.unitName,
       unitCount: p.unitCount,
       costPerUnit: p.costPerUnit,
@@ -137,4 +139,204 @@ export function buildProductAggregates(rows: InventoryRow[], policy: LowStockPol
   }
 
   return aggregates;
+}
+
+/** Every non-healthy severity — anything that is not "healthy" counts as flagged. */
+const FLAGGED_STATES: ReadonlySet<LowStockState> = new Set([
+  "out",
+  "critical",
+  "low",
+  "watch",
+  "overstock",
+  "dead",
+]);
+
+const ALL_STATES: readonly LowStockState[] = [
+  "out",
+  "critical",
+  "low",
+  "watch",
+  "healthy",
+  "overstock",
+  "dead",
+];
+
+export interface DimensionGroup {
+  key: string;
+  label: string;
+  productCount: number;
+  flaggedCount: number;
+  value: number;
+  worst: LowStockState;
+}
+
+function dimensionValue(item: ProductAggregate, dimension: "brand" | "category" | "supplier"): string {
+  const raw = dimension === "brand" ? item.brand : dimension === "category" ? item.category : item.supplier;
+  return (raw ?? "").trim();
+}
+
+/**
+ * Rolls per-dealer product aggregates up by brand, category, or supplier.
+ * `worst` is the most urgent (best SEVERITY_RANK) member state; groups sort
+ * by flagged count, then value at risk.
+ */
+export function groupByDimension(
+  aggregates: ProductAggregate[],
+  dimension: "brand" | "category" | "supplier",
+): DimensionGroup[] {
+  const membersByKey = new Map<string, ProductAggregate[]>();
+  for (const item of aggregates) {
+    const key = dimensionValue(item, dimension);
+    const list = membersByKey.get(key);
+    if (list) list.push(item);
+    else membersByKey.set(key, [item]);
+  }
+
+  const groups: DimensionGroup[] = [];
+  for (const [key, members] of membersByKey) {
+    let flaggedCount = 0;
+    let value = 0;
+    let worst: LowStockState = "healthy";
+    let worstRank = Number.POSITIVE_INFINITY;
+    for (const member of members) {
+      value += member.value;
+      if (FLAGGED_STATES.has(member.state)) flaggedCount += 1;
+      const rank = SEVERITY_RANK[member.state];
+      if (rank < worstRank) {
+        worstRank = rank;
+        worst = member.state;
+      }
+    }
+    groups.push({
+      key,
+      label: key || "Unspecified",
+      productCount: members.length,
+      flaggedCount,
+      value,
+      worst,
+    });
+  }
+
+  groups.sort((a, b) => b.flaggedCount - a.flaggedCount || b.value - a.value);
+  return groups;
+}
+
+export interface BranchAggregate {
+  branchId: number;
+  branchName: string;
+  kind: BranchKind;
+  productCount: number;
+  flaggedCount: number;
+  counts: Record<LowStockState, number>;
+  onHand: number;
+  value: number;
+  worst: LowStockState;
+}
+
+/**
+ * Rolls branch rows up per branch and classifies every product-branch ROW
+ * with the shared severity rules (same per-productCode peer-median idea as
+ * buildProductAggregates, but at row granularity). Joined to the branch's
+ * kind; ordered by flagged count, then value at risk.
+ */
+export function buildBranchAggregates(
+  rows: InventoryRow[],
+  branches: DealerBranch[],
+  policy: LowStockPolicy,
+): BranchAggregate[] {
+  const handsByCode = new Map<string, number[]>();
+  for (const row of rows) {
+    const code = row.productCode || `id:${row.productId}`;
+    const hands = handsByCode.get(code);
+    if (hands) hands.push(row.onHand);
+    else handsByCode.set(code, [row.onHand]);
+  }
+  const medianByCode = new Map<string, number | null>();
+  for (const [code, hands] of handsByCode) {
+    medianByCode.set(
+      code,
+      peerMedianFor(hands.map((onHand) => ({ onHand }))),
+    );
+  }
+
+  const rowsByBranch = new Map<number, InventoryRow[]>();
+  const statesByBranch = new Map<number, LowStockState[]>();
+  for (const row of rows) {
+    const code = row.productCode || `id:${row.productId}`;
+    const { min } = effectiveMinPieces(
+      {
+        maintainingQuantity: row.maintainingQuantity,
+        productCategory: row.productCategory,
+        productId: row.productId,
+        dealerId: row.dealerId,
+        unitCount: row.unitCount,
+      },
+      policy,
+    );
+    const severity = computeSeverity({
+      onHand: row.onHand,
+      demandQty: row.demandQty,
+      windowDays: policy.windowDays,
+      movementAfter: row.movementAfter,
+      effectiveMin: min,
+      unitCount: row.unitCount,
+      leadDays: policy.leadDays,
+      peerMedian: medianByCode.get(code) ?? null,
+      unitName: row.unitName,
+    });
+    const rowList = rowsByBranch.get(row.branchId);
+    if (rowList) rowList.push(row);
+    else rowsByBranch.set(row.branchId, [row]);
+    const stateList = statesByBranch.get(row.branchId);
+    if (stateList) stateList.push(severity.state);
+    else statesByBranch.set(row.branchId, [severity.state]);
+  }
+
+  const branchById = new Map(branches.map((branch) => [branch.branchId, branch]));
+  const branchIds = new Set<number>([
+    ...branches.map((branch) => branch.branchId),
+    ...rowsByBranch.keys(),
+  ]);
+
+  const out: BranchAggregate[] = [];
+  for (const branchId of branchIds) {
+    const info = branchById.get(branchId);
+    const list = rowsByBranch.get(branchId) ?? [];
+    const states = statesByBranch.get(branchId) ?? [];
+    const counts = {} as Record<LowStockState, number>;
+    for (const state of ALL_STATES) counts[state] = 0;
+    let flaggedCount = 0;
+    let onHand = 0;
+    let value = 0;
+    let worst: LowStockState = "healthy";
+    let worstRank = Number.POSITIVE_INFINITY;
+    states.forEach((state, index) => {
+      counts[state] += 1;
+      if (FLAGGED_STATES.has(state)) flaggedCount += 1;
+      const rank = SEVERITY_RANK[state];
+      if (rank < worstRank) {
+        worstRank = rank;
+        worst = state;
+      }
+      const row = list[index];
+      if (row) {
+        onHand += row.onHand;
+        value += inventoryValue(row.onHand, row.unitCount, row.costPerUnit);
+      }
+    });
+    out.push({
+      branchId,
+      branchName: info?.branchName ?? list[0]?.branchName ?? `Branch ${branchId}`,
+      kind: info?.kind ?? "other",
+      productCount: new Set(list.map((row) => row.productId)).size,
+      flaggedCount,
+      counts,
+      onHand,
+      value,
+      worst,
+    });
+  }
+
+  out.sort((a, b) => b.flaggedCount - a.flaggedCount || b.value - a.value);
+  return out;
 }

@@ -17,6 +17,8 @@ interface LowStockBoardProps {
   aggregates: ProductAggregate[];
   dealers: DealerStatus[];
   onSelect: (dealerId: string, productId: number) => void;
+  title?: string;
+  emptyHint?: string;
 }
 
 const GRID_CAP = 48;
@@ -47,7 +49,7 @@ function coverLabel(daysOfCover: number | null): string {
   return `${Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)}d`;
 }
 
-export function LowStockBoard({ aggregates, dealers, onSelect }: LowStockBoardProps) {
+export function LowStockBoard({ aggregates, dealers, onSelect, title, emptyHint }: LowStockBoardProps) {
   const [view, setView] = React.useState<"grid" | "list">("grid");
   const [query, setQuery] = React.useState("");
   const [sortByValue, setSortByValue] = React.useState(false);
@@ -107,7 +109,8 @@ export function LowStockBoard({ aggregates, dealers, onSelect }: LowStockBoardPr
   }, [aggregates]);
 
   return (
-    <section aria-label="Low-stock board" className="space-y-2">
+    <section aria-label={title ?? "Low-stock board"} className="space-y-2">
+      {title && <h3 className="text-sm font-semibold">{title}</h3>}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-0.5 self-start rounded-lg border border-border p-0.5" role="group" aria-label="Board view">
           <Button
@@ -183,7 +186,7 @@ export function LowStockBoard({ aggregates, dealers, onSelect }: LowStockBoardPr
         <div className="rounded-xl border border-dashed p-8 text-center">
           <p className="text-sm font-medium">No products match this filter</p>
           <p className="mt-1 text-xs text-muted-foreground">
-            Clear the search or pick a different dealer set to see low-stock signals.
+            {emptyHint ?? "Clear the search or pick a different dealer set to see low-stock signals."}
           </p>
         </div>
       ) : view === "grid" ? (
