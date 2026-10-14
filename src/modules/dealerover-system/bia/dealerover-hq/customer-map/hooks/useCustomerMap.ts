@@ -120,7 +120,14 @@ export function useCustomerMap(): UseCustomerMapResult {
 
     const initialStates: Record<string, DealerLaneState> = {};
     for (const entry of rosterEntries) {
-      initialStates[entry.dealerId] = { loading: true, online: true, loaded: 0, done: false };
+      initialStates[entry.dealerId] = {
+        loading: true,
+        online: true,
+        scanned: 0,
+        plotted: 0,
+        withoutLocation: 0,
+        done: false,
+      };
     }
     setDealerStates(initialStates);
 
@@ -133,9 +140,9 @@ export function useCustomerMap(): UseCustomerMapResult {
       const controller = new AbortController();
       laneControllersRef.current.set(entry.dealerId, controller);
       let page = 0;
-      let loaded = 0;
       let total: number | undefined;
       let laneRows = 0;
+      let laneScanned = 0;
       let laneError: string | undefined;
       try {
         for (;;) {
@@ -165,7 +172,9 @@ export function useCustomerMap(): UseCustomerMapResult {
           const hasMore = pagePayload.hasMore;
           if (typeof pagePayload.total === "number") total = pagePayload.total;
           laneRows += rows.length;
-          loaded += rows.length;
+          // Scanned = what the dealer returned (advances to `total`);
+          // laneRows = what survived mapping, i.e. what is on the map.
+          laneScanned += pagePayload.fetched ?? rows.length;
           mergedTotal += rows.length;
           const done = !hasMore;
           const pageLookups = pagePayload.lookups;
@@ -191,7 +200,9 @@ export function useCustomerMap(): UseCustomerMapResult {
             [entry.dealerId]: {
               loading: !done,
               online: true,
-              loaded,
+              scanned: laneScanned,
+              plotted: laneRows,
+              withoutLocation: Math.max(0, laneScanned - laneRows),
               ...(laneTotal !== undefined ? { total: laneTotal } : {}),
               done,
             },
@@ -237,7 +248,9 @@ export function useCustomerMap(): UseCustomerMapResult {
         [entry.dealerId]: {
           loading: false,
           online: !failed,
-          loaded: finalLoaded,
+          scanned: laneScanned,
+          plotted: finalLoaded,
+          withoutLocation: Math.max(0, laneScanned - finalLoaded),
           ...(finalTotal !== undefined ? { total: finalTotal } : {}),
           done: true,
           ...(failed && finalError ? { error: finalError } : {}),

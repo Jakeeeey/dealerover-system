@@ -235,6 +235,12 @@ export interface CustomerPagePayload extends DealerIdentity {
   pageSize: number;
   total?: number;
   hasMore: boolean;
+  /**
+   * Raw rows read from the dealer for this page, before coordinate filtering.
+   * Optional because the failure payloads carry no rows; the zod schema
+   * defaults it to 0 so the client always receives a number.
+   */
+  fetched?: number;
   customers: CustomerMapRow[];
   lookups?: { storeTypes: LookupItem[]; classifications: LookupItem[] };
   error?: string;
@@ -538,6 +544,7 @@ export async function fetchCustomerPage(
     pageSize: safeSize,
     ...(total !== undefined ? { total } : {}),
     hasMore: rawCustomers.length === safeSize,
+    fetched: rawCustomers.length,
     customers,
     ...(lookups ? { lookups } : {}),
   };

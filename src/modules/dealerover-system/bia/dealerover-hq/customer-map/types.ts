@@ -82,7 +82,12 @@ export const DealerRosterResponseSchema = z.object({
 
 export type DealerRosterResponse = z.infer<typeof DealerRosterResponseSchema>;
 
-/** One page of a single dealer's customers — a lane's unit of progress. */
+/**
+ * One page of a single dealer's customers — a lane's unit of progress.
+ * `total` and `fetched` are counted in SCANNED rows (what the dealer holds),
+ * while `customers` carries only the rows that have usable coordinates — so its
+ * length is the PLOTTED count and is normally smaller than `fetched`.
+ */
 export const CustomerPageResponseSchema = z.object({
   success: z.boolean(),
   dealerId: z.string(),
@@ -93,6 +98,8 @@ export const CustomerPageResponseSchema = z.object({
   pageSize: z.number(),
   total: z.number().optional(),
   hasMore: z.boolean(),
+  /** Rows read from the dealer for this page, before coordinate filtering. */
+  fetched: z.number().default(0),
   customers: z.array(CustomerMapRowSchema),
   lookups: z
     .object({
@@ -109,7 +116,12 @@ export type CustomerPageResponse = z.infer<typeof CustomerPageResponseSchema>;
 export interface DealerLaneState {
   loading: boolean;
   online: boolean;
-  loaded: number;
+  /** Rows read from the dealer so far — the progress unit; advances to `total`. */
+  scanned: number;
+  /** Rows with usable coordinates, i.e. what is actually on the map. */
+  plotted: number;
+  /** Scanned rows skipped because the customer has no coordinates. */
+  withoutLocation: number;
   total?: number;
   done: boolean;
   error?: string;
