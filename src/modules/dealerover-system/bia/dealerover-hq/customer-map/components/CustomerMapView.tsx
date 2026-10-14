@@ -16,6 +16,7 @@ import type {
   CustomerMapBasemap,
   CustomerMapMarkerStyle,
   CustomerMapRow,
+  DealerLaneState,
   DealerStatus,
 } from "../types";
 import { MARKER_STROKE_COLOR } from "../utils/dealer-colors";
@@ -168,6 +169,10 @@ interface CustomerMapViewProps {
   selectedDealerIds: string[];
   /** Flips one dealer's membership in the filter (empty array = all). */
   onToggleDealer: (dealerId: string) => void;
+  /** Per-dealer streaming lane states — legend chips show a quiet progress
+   * hint while a lane is still running. Optional so the merged response shape
+   * keeps working on its own. */
+  dealerStates?: Record<string, DealerLaneState>;
 }
 
 /**
@@ -640,7 +645,22 @@ interface DealerToggleProps {
   count: number;
   offline: boolean;
   active: boolean;
+  /** Streaming lane state — drives the quiet per-dealer progress hint. */
+  state?: DealerLaneState;
   onToggle: () => void;
+}
+
+/**
+ * Progress hint for a dealer lane that is still streaming (existing chip
+ * styling + semantic tokens only): `loaded / total` once the page-0 total is
+ * known, the loaded count while it is not, and "loading…" before the first
+ * page lands. Null once the lane settles — the settled count takes over.
+ */
+function streamingHint(count: number, state?: DealerLaneState): string | null {
+  if (!state || !state.loading) return null;
+  if (state.total !== undefined) return `${formatNumber(state.loaded)} / ${formatNumber(state.total)}`;
+  if (state.loaded > 0 || count > 0) return `${formatNumber(Math.max(state.loaded, count))}…`;
+  return "loading…";
 }
 
 function DealerDot({ color }: { color: string }) {
@@ -654,7 +674,8 @@ function DealerDot({ color }: { color: string }) {
 }
 
 /** Inline pill chip — a filter toggle (colour dot + name + count). */
-function DealerLegendChip({ dealer, count, offline, active, onToggle }: DealerToggleProps) {
+function DealerLegendChip({ dealer, count, offline, active, state, onToggle }: DealerToggleProps) {
+  const hint = streamingHint(count, state);
   return (
     <button
       type="button"
@@ -672,6 +693,10 @@ function DealerLegendChip({ dealer, count, offline, active, onToggle }: DealerTo
       </span>
       {offline ? (
         <span className="font-medium text-destructive">offline</span>
+      ) : hint !== null ? (
+        <span className="tabular-nums text-muted-foreground" title="Still loading this dealer">
+          {hint}
+        </span>
       ) : (
         <span className="tabular-nums text-muted-foreground">{formatNumber(count)}</span>
       )}
@@ -680,7 +705,8 @@ function DealerLegendChip({ dealer, count, offline, active, onToggle }: DealerTo
 }
 
 /** Full-width row inside the "+N" popover — same toggle, room for long names. */
-function DealerLegendRow({ dealer, count, offline, active, onToggle }: DealerToggleProps) {
+function DealerLegendRow({ dealer, count, offline, active, state, onToggle }: DealerToggleProps) {
+  const hint = streamingHint(count, state);
   return (
     <button
       type="button"
@@ -698,6 +724,10 @@ function DealerLegendRow({ dealer, count, offline, active, onToggle }: DealerTog
       </span>
       {offline ? (
         <span className="shrink-0 font-medium text-destructive">offline</span>
+      ) : hint !== null ? (
+        <span className="shrink-0 tabular-nums text-muted-foreground" title="Still loading this dealer">
+          {hint}
+        </span>
       ) : (
         <span className="shrink-0 tabular-nums text-muted-foreground">{formatNumber(count)}</span>
       )}
@@ -715,6 +745,7 @@ export function CustomerMapView({
   boundaryHighlight = null,
   selectedDealerIds,
   onToggleDealer,
+  dealerStates = {},
 }: CustomerMapViewProps) {
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const mapRef = React.useRef<MapLibreMap | null>(null);
@@ -1290,6 +1321,7 @@ export function CustomerMapView({
                         count={perDealerCounts[dealer.id] ?? 0}
                         offline={offlineDealerIds.has(dealer.id)}
                         active={isDealerActive(dealer.id)}
+                        state={dealerStates[dealer.id]}
                         onToggle={() => onToggleDealer(dealer.id)}
                       />
                     </li>
@@ -1316,6 +1348,7 @@ export function CustomerMapView({
                               count={perDealerCounts[dealer.id] ?? 0}
                               offline={offlineDealerIds.has(dealer.id)}
                               active={isDealerActive(dealer.id)}
+                              state={dealerStates[dealer.id]}
                               onToggle={() => onToggleDealer(dealer.id)}
                             />
                           </li>

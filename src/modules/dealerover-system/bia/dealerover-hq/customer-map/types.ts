@@ -66,6 +66,55 @@ export const CustomerMapResponseSchema = z.object({
 
 export type CustomerMapResponse = z.infer<typeof CustomerMapResponseSchema>;
 
+/** One dealer in the HQ roster — the picker source that never depends on map data. */
+export const DealerRosterEntrySchema = z.object({
+  dealerId: z.string(),
+  dealerName: z.string(),
+  dealerCode: z.string(),
+});
+
+export type DealerRosterEntry = z.infer<typeof DealerRosterEntrySchema>;
+
+export const DealerRosterResponseSchema = z.object({
+  success: z.boolean(),
+  roster: z.array(DealerRosterEntrySchema),
+});
+
+export type DealerRosterResponse = z.infer<typeof DealerRosterResponseSchema>;
+
+/** One page of a single dealer's customers — a lane's unit of progress. */
+export const CustomerPageResponseSchema = z.object({
+  success: z.boolean(),
+  dealerId: z.string(),
+  dealerName: z.string(),
+  dealerCode: z.string(),
+  online: z.boolean(),
+  page: z.number(),
+  pageSize: z.number(),
+  total: z.number().optional(),
+  hasMore: z.boolean(),
+  customers: z.array(CustomerMapRowSchema),
+  lookups: z
+    .object({
+      storeTypes: z.array(LookupItemSchema),
+      classifications: z.array(LookupItemSchema),
+    })
+    .optional(),
+  error: z.string().optional(),
+});
+
+export type CustomerPageResponse = z.infer<typeof CustomerPageResponseSchema>;
+
+/** Per-dealer streaming state for one lane (keyed by dealer id). */
+export interface DealerLaneState {
+  loading: boolean;
+  online: boolean;
+  loaded: number;
+  total?: number;
+  done: boolean;
+  error?: string;
+}
+
 /** Client-side filter shape applied over the loaded (active) customer set. */
 export interface CustomerMapFilterState {
   dealerIds: string[];

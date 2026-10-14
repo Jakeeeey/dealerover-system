@@ -1,9 +1,4 @@
-import {
-  type CustomerMapResponse,
-  type CustomerMapRow,
-  type DealerStatus,
-  type LookupItem,
-} from "../types";
+import { type CustomerMapRow, type LookupItem } from "../types";
 import { resolveAdmin } from "./boundaries-service";
 
 /**
@@ -41,9 +36,24 @@ const CUSTOMER_FIELDS = [
 const DEALER_LIST_FIELDS =
   "dealer_id,dealer_name,dealer_code,directus,directus_token,springboot,status,is_default";
 
-/** Per-dealer request budget — a slow dealer must not stall the whole map. */
-const FETCH_TIMEOUT_MS = 6000;
+/**
+ * Roster request budget. The roster is a small row set on main Directus, so it
+ * stays tight: a dead registry must not hold the whole map open.
+ */
+const ROSTER_TIMEOUT_MS = 6000;
+/**
+ * Per-dealer customer budget. Men2 Dealer Marikina serves ~14.6k customers
+ * (~4.9 MB) and measures 2.2-4.0 s from here and longer from other networks;
+ * the previous shared 6 s budget reported it as falsely "offline". Only the
+ * customer request gets this room — the catalog lookups keep the tight budget
+ * below.
+ */
+const CUSTOMER_TIMEOUT_MS = 30000;
+/** Catalog lookups are tiny; a slow one degrades to empty labels. */
+const LOOKUP_TIMEOUT_MS = 6000;
 const DEALER_LIST_TTL_MS = 5 * 60 * 1000;
+/** A 4.9 MB per-dealer pull must not repeat on every refresh or dealer switch. */
+const CUSTOMER_CACHE_TTL_MS = 3 * 60 * 1000;
 
 interface DealerRow {
   dealer_id: number | string;
@@ -85,12 +95,6 @@ interface StoreTypeRecord {
 interface ClassificationRecord {
   id?: number | string;
   classification_name?: string | null;
-}
-
-interface DealerBundle {
-  customers: RawCustomer[];
-  storeTypes: LookupItem[];
-  classifications: LookupItem[];
 }
 
 /** Coerces any Directus scalar to a finite integer (booleans map to 1/0). */
@@ -197,7 +201,7 @@ async function getDealerList(): Promise<DealerRow[]> {
       "Content-Type": "application/json",
       Authorization: `Bearer ${STATIC_TOKEN}`,
     },
-    AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    AbortSignal.timeout(ROSTER_TIMEOUT_MS),
   );
   const rows = extractData<DealerRow>(payload);
   DEALER_LIST_CACHE.data = rows;
@@ -205,202 +209,338 @@ async function getDealerList(): Promise<DealerRow[]> {
   return rows;
 }
 
-/**
- * Fetches one dealer's customers plus its two lookup catalogs.
- * Lookup failures degrade to empty labels; a customer failure rejects the dealer.
- * @param {DealerRow} dealer - Roster row carrying the dealer's own Directus URL + token.
- * @returns {Promise<DealerBundle>} Raw customers and resolved lookup entries.
- */
-async function fetchDealerBundle(dealer: DealerRow): Promise<DealerBundle> {
-  const base = (dealer.directus || "").replace(/\/+$/, "");
-  if (!base) {
-    throw new Error("ERR_CONFIG: Dealer has no Directus base URL configured");
-  }
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${dealer.directus_token || ""}`,
-  };
-  const signal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+// Per-page cache for the streaming lanes: `dealerId:page:pageSize`.
+// A slow dealer's early pages must not be re-pulled when a later page lands.
+const CUSTOMER_PAGE_CACHE = new Map<string, { data: CustomerPagePayload; expiry: number }>();
 
-  const [customersResult, storeTypeResult, classificationResult] = await Promise.allSettled([
-    fetchJson(`${base}/items/customer?limit=-1&fields=${CUSTOMER_FIELDS}`, headers, signal),
-    fetchJson(`${base}/items/store_type?limit=-1&fields=id,store_type`, headers, signal),
-    fetchJson(
-      `${base}/items/customer_classification?limit=-1&fields=id,classification_name`,
-      headers,
-      signal,
-    ),
-  ]);
+// Per-dealer lookup catalogs, cached separately from the pages so later pages
+// (which carry no lookups) still resolve against the page-0 catalogs.
+const DEALER_LOOKUP_CACHE = new Map<
+  string,
+  { data: { storeTypes: LookupItem[]; classifications: LookupItem[] }; expiry: number }
+>();
 
-  if (customersResult.status === "rejected") {
-    throw customersResult.reason instanceof Error
-      ? customersResult.reason
-      : new Error("ERR_API_FAIL: Dealer customer fetch failed");
-  }
+/** Dealer identity carried on every page payload (ids collide across dealers). */
+interface DealerIdentity {
+  dealerId: string;
+  dealerName: string;
+  dealerCode: string;
+}
 
-  const storeTypes = extractData<StoreTypeRecord>(
-    storeTypeResult.status === "fulfilled" ? storeTypeResult.value : null,
-  )
-    .map((record) => ({
-      id: toInt(record.id),
-      name: str(record.store_type),
-    }))
-    .filter((item) => item.id > 0 && item.name);
+/** Page payload before zod validation at the provider boundary. */
+export interface CustomerPagePayload extends DealerIdentity {
+  success: boolean;
+  online: boolean;
+  page: number;
+  pageSize: number;
+  total?: number;
+  hasMore: boolean;
+  customers: CustomerMapRow[];
+  lookups?: { storeTypes: LookupItem[]; classifications: LookupItem[] };
+  error?: string;
+}
 
-  const classifications = extractData<ClassificationRecord>(
-    classificationResult.status === "fulfilled" ? classificationResult.value : null,
-  )
-    .map((record) => ({
-      id: toInt(record.id),
-      name: str(record.classification_name),
-    }))
-    .filter((item) => item.id > 0 && item.name);
+/** Default page size for the streaming lanes. Measured: `limit=1000` answers in
+ * ~4.2 s on the slowest dealer while a full 14.6k-row pull takes ~117 s, so
+ * 1000 rows is the first-paint sweet spot — small dealers finish in one page. */
+export const CUSTOMER_PAGE_SIZE = 1000;
+const CUSTOMER_PAGE_SIZE_MIN = 100;
+const CUSTOMER_PAGE_SIZE_MAX = 5000;
 
+function clampPageSize(pageSize: number): number {
+  if (!Number.isFinite(pageSize)) return CUSTOMER_PAGE_SIZE;
+  return Math.min(CUSTOMER_PAGE_SIZE_MAX, Math.max(CUSTOMER_PAGE_SIZE_MIN, Math.trunc(pageSize)));
+}
+
+function dealerIdentityOf(dealer: DealerRow): DealerIdentity {
+  const dealerId = String(dealer.dealer_id);
   return {
-    customers: extractData<RawCustomer>(customersResult.value),
-    storeTypes,
-    classifications,
+    dealerId,
+    dealerName: str(dealer.dealer_name) || `Dealer ${dealerId}`,
+    dealerCode: str(dealer.dealer_code),
   };
 }
 
 /**
- * Aggregates every dealer's customers into a single map-ready payload.
- * @param {string} [dealerId] - Optional dealer id to scope the fetch to one dealer.
- * @returns {Promise<CustomerMapResponse>} Flat customer rows, dealer statuses, and lookups.
+ * Maps raw customer rows to plotted map rows. Shared by the full aggregation
+ * and the paged lanes so both paths resolve coordinates, dealer tags, and
+ * lookup names identically (lookup ids are per-dealer and collide across dealers).
+ * @param {RawCustomer[]} rawCustomers - Raw customer records for one dealer page.
+ * @param {LookupItem[]} storeTypes - That dealer's own store-type catalog.
+ * @param {LookupItem[]} classifications - That dealer's own classification catalog.
+ * @param {DealerIdentity} dealer - Dealer identity tagging every row.
+ * @returns {CustomerMapRow[]} Mapped rows (customers without usable coordinates dropped).
  */
-export async function fetchCustomerMap(dealerId?: string): Promise<CustomerMapResponse> {
-  const empty: CustomerMapResponse = {
-    success: true,
-    dealerStatuses: [],
-    customers: [],
-    lookups: { storeTypes: [], classifications: [] },
-  };
+function mapCustomerRows(
+  rawCustomers: RawCustomer[],
+  storeTypes: LookupItem[],
+  classifications: LookupItem[],
+  dealer: DealerIdentity,
+): CustomerMapRow[] {
+  // Resolve names against THIS dealer's own catalogs — ids are not global.
+  const localStoreTypes = new Map(storeTypes.map((item) => [item.id, item.name]));
+  const localClassifications = new Map(classifications.map((item) => [item.id, item.name]));
+  const rows: CustomerMapRow[] = [];
 
-  if (!UPSTREAM) {
-    console.error("ERR_CONFIG: [CustomerMap] NEXT_PUBLIC_API_BASE_URL is not defined");
-    return { ...empty, success: false, error: "Server configuration error" };
+  for (const raw of rawCustomers) {
+    const coords = resolveCoordinates(raw);
+    if (!coords) continue; // Drop customers with no usable coordinates.
+    const id = toInt(raw.id);
+    if (id <= 0) continue;
+    // Raw PSGC text columns are unreliable (often empty), so geo labels are
+    // derived server-side from the coordinates via the PSGC boundary index.
+    // Rows with no coordinates are dropped above; resolved misses keep "".
+    const admin = resolveAdmin(coords.lng, coords.lat);
+
+    const storeTypeId =
+      raw.store_type === null || raw.store_type === undefined ? null : toInt(raw.store_type);
+    const classificationId =
+      raw.classification === null || raw.classification === undefined
+        ? null
+        : toInt(raw.classification);
+
+    rows.push({
+      key: `${dealer.dealerId}:${id}`,
+      dealerId: dealer.dealerId,
+      dealerName: dealer.dealerName,
+      dealerCode: dealer.dealerCode,
+      id,
+      customer_code: str(raw.customer_code),
+      customer_name: str(raw.customer_name),
+      store_name: str(raw.store_name),
+      brgy: admin.brgy ?? "",
+      city: admin.city ?? "",
+      province: admin.province ?? "",
+      store_type: storeTypeId,
+      store_type_name: storeTypeId !== null ? localStoreTypes.get(storeTypeId) ?? "" : "",
+      classification: classificationId,
+      classification_name:
+        classificationId !== null ? localClassifications.get(classificationId) ?? "" : "",
+      price_type: str(raw.price_type),
+      payment_term: str(raw.payment_term),
+      isActive: toInt(raw.isActive),
+      lat: coords.lat,
+      lng: coords.lng,
+    });
   }
+
+  return rows;
+}
+
+/**
+ * Reads filter_count for one dealer's customer collection (cheap: no rows).
+ * @param {string} base - Dealer Directus base URL.
+ * @param {Record<string, string>} headers - Dealer auth headers.
+ * @param {AbortSignal} signal - Request budget signal.
+ * @returns {Promise<number | undefined>} Total row count, or undefined on failure.
+ */
+async function fetchCustomerTotal(
+  base: string,
+  headers: Record<string, string>,
+  signal: AbortSignal,
+): Promise<number | undefined> {
+  try {
+    const payload = await fetchJson(
+      `${base}/items/customer?limit=0&meta=filter_count`,
+      headers,
+      signal,
+    );
+    const meta = (payload as { meta?: { filter_count?: unknown } } | null)?.meta;
+    const total = Number(meta?.filter_count);
+    return Number.isFinite(total) && total >= 0 ? Math.trunc(total) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Returns the HQ dealer roster from the already-cached registry list. Never
+ * touches dealer instances, so the picker renders even when every dealer is down.
+ * @returns {Promise<{ dealerId: string; dealerName: string; dealerCode: string }[]>} Roster entries.
+ */
+export async function fetchDealerRoster(): Promise<
+  { dealerId: string; dealerName: string; dealerCode: string }[]
+> {
+  const roster = await getDealerList();
+  return roster.map((dealer) => {
+    const identity = dealerIdentityOf(dealer);
+    return {
+      dealerId: identity.dealerId,
+      dealerName: identity.dealerName,
+      dealerCode: identity.dealerCode,
+    };
+  });
+}
+
+/**
+ * Fetches one page of one dealer's customers. Page 0 also resolves that
+ * dealer's lookup catalogs plus a cheap `filter_count` total so the UI can
+ * show progress; later pages return rows only. Pages are cached per
+ * `dealerId:page:pageSize`; failures are never cached. Pages for one dealer
+ * must be read sequentially — parallel Directus calls on one instance 503.
+ * @param {string} dealerId - Roster dealer id to page.
+ * @param {number} page - Zero-based page index.
+ * @param {number} pageSize - Rows per page (clamped to 100..5000, default 1000).
+ * @param {{ bypassCache?: boolean }} [options] - Skip page + lookup caches on refresh.
+ * @returns {Promise<CustomerPagePayload>} Page payload with mapped rows.
+ */
+export async function fetchCustomerPage(
+  dealerId: string,
+  page: number,
+  pageSize: number,
+  options?: { bypassCache?: boolean },
+): Promise<CustomerPagePayload> {
+  const safePage = Number.isFinite(page) && page >= 0 ? Math.trunc(page) : 0;
+  const safeSize = clampPageSize(pageSize);
+  const bypassCache = options?.bypassCache === true;
 
   let roster: DealerRow[];
   try {
     roster = await getDealerList();
   } catch (error) {
     console.error("ERR_API_FAIL: [CustomerMap] Failed to load dealer roster:", error);
-    return { ...empty, success: false, error: "Unable to reach the dealer registry" };
+    return {
+      success: false,
+      dealerId: String(dealerId),
+      dealerName: `Dealer ${String(dealerId)}`,
+      dealerCode: "",
+      online: false,
+      page: safePage,
+      pageSize: safeSize,
+      hasMore: false,
+      customers: [],
+      error: "Unable to reach the dealer registry",
+    };
   }
 
-  const selected = dealerId
-    ? roster.filter((dealer) => String(dealer.dealer_id) === String(dealerId))
-    : roster;
-
-  if (dealerId && selected.length === 0) {
-    return { ...empty, success: false, error: `Unknown dealer: ${dealerId}` };
+  const dealer = roster.find((entry) => String(entry.dealer_id) === String(dealerId));
+  if (!dealer) {
+    return {
+      success: false,
+      dealerId: String(dealerId),
+      dealerName: `Dealer ${String(dealerId)}`,
+      dealerCode: "",
+      online: false,
+      page: safePage,
+      pageSize: safeSize,
+      hasMore: false,
+      customers: [],
+      error: `Unknown dealer: ${String(dealerId)}`,
+    };
   }
 
-  const results = await Promise.allSettled(selected.map((dealer) => fetchDealerBundle(dealer)));
+  const identity = dealerIdentityOf(dealer);
+  const base = (dealer.directus || "").replace(/\/+$/, "");
+  if (!base) {
+    return {
+      success: false,
+      ...identity,
+      online: false,
+      page: safePage,
+      pageSize: safeSize,
+      hasMore: false,
+      customers: [],
+      error: "Dealer has no Directus base URL configured",
+    };
+  }
 
-  const customers: CustomerMapRow[] = [];
-  const dealerStatuses: DealerStatus[] = [];
-  // Dedupe lookups by name: ids are per-dealer and can collide across dealers.
-  const storeTypeUnion = new Map<string, LookupItem>();
-  const classificationUnion = new Map<string, LookupItem>();
+  const pageKey = `${identity.dealerId}:${safePage}:${safeSize}`;
+  if (!bypassCache) {
+    const cached = CUSTOMER_PAGE_CACHE.get(pageKey);
+    if (cached && cached.expiry > Date.now()) return cached.data;
+  }
 
-  results.forEach((result, index) => {
-    const dealer = selected[index];
-    const dealerIdStr = String(dealer.dealer_id);
-    const dealerName = str(dealer.dealer_name) || `Dealer ${dealerIdStr}`;
-    const dealerCode = str(dealer.dealer_code);
-
-    if (result.status === "rejected") {
-      console.error(`ERR_API_FAIL: [CustomerMap] Dealer "${dealerName}" is offline:`, result.reason);
-      dealerStatuses.push({
-        dealerId: dealerIdStr,
-        dealerName,
-        dealerCode,
-        online: false,
-        customerCount: 0,
-        error: "Dealer database unreachable",
-      });
-      return;
-    }
-
-    const bundle = result.value;
-    // Resolve names against THIS dealer's own catalogs — ids are not global.
-    const localStoreTypes = new Map(bundle.storeTypes.map((item) => [item.id, item.name]));
-    const localClassifications = new Map(
-      bundle.classifications.map((item) => [item.id, item.name]),
-    );
-    bundle.storeTypes.forEach((item) => {
-      if (!storeTypeUnion.has(item.name)) storeTypeUnion.set(item.name, item);
-    });
-    bundle.classifications.forEach((item) => {
-      if (!classificationUnion.has(item.name)) classificationUnion.set(item.name, item);
-    });
-
-    let plotted = 0;
-    for (const raw of bundle.customers) {
-      const coords = resolveCoordinates(raw);
-      if (!coords) continue; // Drop customers with no usable coordinates.
-      const id = toInt(raw.id);
-      if (id <= 0) continue;
-
-      // Raw PSGC text columns are unreliable (often empty), so geo labels are
-      // derived server-side from the coordinates via the PSGC boundary index.
-      // Rows with no coordinates are dropped above; resolved misses keep "".
-      const admin = resolveAdmin(coords.lng, coords.lat);
-
-      const storeTypeId = raw.store_type === null || raw.store_type === undefined
-        ? null
-        : toInt(raw.store_type);
-      const classificationId =
-        raw.classification === null || raw.classification === undefined
-          ? null
-          : toInt(raw.classification);
-
-      customers.push({
-        key: `${dealerIdStr}:${id}`,
-        dealerId: dealerIdStr,
-        dealerName,
-        dealerCode,
-        id,
-        customer_code: str(raw.customer_code),
-        customer_name: str(raw.customer_name),
-        store_name: str(raw.store_name),
-        brgy: admin.brgy ?? "",
-        city: admin.city ?? "",
-        province: admin.province ?? "",
-        store_type: storeTypeId,
-        store_type_name: storeTypeId !== null ? localStoreTypes.get(storeTypeId) ?? "" : "",
-        classification: classificationId,
-        classification_name:
-          classificationId !== null ? localClassifications.get(classificationId) ?? "" : "",
-        price_type: str(raw.price_type),
-        payment_term: str(raw.payment_term),
-        isActive: toInt(raw.isActive),
-        lat: coords.lat,
-        lng: coords.lng,
-      });
-      plotted += 1;
-    }
-
-    dealerStatuses.push({
-      dealerId: dealerIdStr,
-      dealerName,
-      dealerCode,
-      online: true,
-      customerCount: plotted,
-    });
-  });
-
-  const sortByName = (a: LookupItem, b: LookupItem) => a.name.localeCompare(b.name);
-
-  return {
-    success: true,
-    dealerStatuses,
-    customers,
-    lookups: {
-      storeTypes: Array.from(storeTypeUnion.values()).sort(sortByName),
-      classifications: Array.from(classificationUnion.values()).sort(sortByName),
-    },
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${dealer.directus_token || ""}`,
   };
+
+  // Page 0 resolves the dealer's own catalogs (cached separately, same TTL)
+  // plus a cheap total for progress; later pages return rows only.
+  let storeTypes: LookupItem[] = [];
+  let classifications: LookupItem[] = [];
+  let lookups: CustomerPagePayload["lookups"];
+  let total: number | undefined;
+  if (safePage === 0) {
+    const cachedLookups = !bypassCache ? DEALER_LOOKUP_CACHE.get(identity.dealerId) : undefined;
+    if (cachedLookups && cachedLookups.expiry > Date.now()) {
+      storeTypes = cachedLookups.data.storeTypes;
+      classifications = cachedLookups.data.classifications;
+    } else {
+      const [storeTypeResult, classificationResult, totalResult] = await Promise.allSettled([
+        fetchJson(
+          `${base}/items/store_type?limit=-1&fields=id,store_type`,
+          headers,
+          AbortSignal.timeout(LOOKUP_TIMEOUT_MS),
+        ),
+        fetchJson(
+          `${base}/items/customer_classification?limit=-1&fields=id,classification_name`,
+          headers,
+          AbortSignal.timeout(LOOKUP_TIMEOUT_MS),
+        ),
+        fetchCustomerTotal(base, headers, AbortSignal.timeout(LOOKUP_TIMEOUT_MS)),
+      ]);
+      storeTypes = extractData<StoreTypeRecord>(
+        storeTypeResult.status === "fulfilled" ? storeTypeResult.value : null,
+      )
+        .map((record) => ({ id: toInt(record.id), name: str(record.store_type) }))
+        .filter((item) => item.id > 0 && item.name);
+      classifications = extractData<ClassificationRecord>(
+        classificationResult.status === "fulfilled" ? classificationResult.value : null,
+      )
+        .map((record) => ({ id: toInt(record.id), name: str(record.classification_name) }))
+        .filter((item) => item.id > 0 && item.name);
+      total =
+        totalResult.status === "fulfilled" && typeof totalResult.value === "number"
+          ? totalResult.value
+          : undefined;
+      DEALER_LOOKUP_CACHE.set(identity.dealerId, {
+        data: { storeTypes, classifications },
+        expiry: Date.now() + CUSTOMER_CACHE_TTL_MS,
+      });
+    }
+    lookups = { storeTypes, classifications };
+  }
+
+  let rawCustomers: RawCustomer[];
+  try {
+    const payload = await fetchJson(
+      `${base}/items/customer?limit=${safeSize}&offset=${safePage * safeSize}&sort=id&fields=${CUSTOMER_FIELDS}`,
+      headers,
+      AbortSignal.timeout(CUSTOMER_TIMEOUT_MS),
+    );
+    rawCustomers = extractData<RawCustomer>(payload);
+  } catch (reason) {
+    const timedOut =
+      reason instanceof Error && (reason.name === "TimeoutError" || reason.name === "AbortError");
+    console.error(`ERR_API_FAIL: [CustomerMap] Dealer "${identity.dealerName}" page failed:`, reason);
+    return {
+      success: false,
+      ...identity,
+      online: false,
+      page: safePage,
+      pageSize: safeSize,
+      hasMore: false,
+      customers: [],
+      ...(lookups ? { lookups } : {}),
+      error: timedOut ? "Dealer timed out responding" : "Dealer database unreachable",
+    };
+  }
+
+  const customers = mapCustomerRows(rawCustomers, storeTypes, classifications, identity);
+  // Paging continues while the upstream still has rows: the raw row count is
+  // the signal (mapped rows may drop coordinate-less entries).
+  const payload: CustomerPagePayload = {
+    success: true,
+    ...identity,
+    online: true,
+    page: safePage,
+    pageSize: safeSize,
+    ...(total !== undefined ? { total } : {}),
+    hasMore: rawCustomers.length === safeSize,
+    customers,
+    ...(lookups ? { lookups } : {}),
+  };
+  CUSTOMER_PAGE_CACHE.set(pageKey, { data: payload, expiry: Date.now() + CUSTOMER_CACHE_TTL_MS });
+  return payload;
 }

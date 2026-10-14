@@ -38,7 +38,7 @@ function uniqueSorted(values: string[]): string[] {
 }
 
 export default function CustomerMapPage() {
-  const { data, isLoading, error, refresh } = useCustomerMap();
+  const { data, roster, dealerStates, isLoading, error, refresh } = useCustomerMap();
   const [stageEl, setStageEl] = React.useState<HTMLDivElement | null>(null);
   const { isFullscreen, toggle: toggleFullscreen } = useFullscreen<HTMLDivElement>(stageEl);
   const [filters, setFilters] = React.useState<CustomerMapFilterState>({
@@ -88,20 +88,31 @@ export default function CustomerMapPage() {
   );
 
   const dealers = React.useMemo(() => {
+    // Roster first: the picker must never depend on what is selected or has
+    // streamed so far (a slow lane must not hide the other dealers). Only when
+    // the roster is still empty do we fall back to the streamed statuses.
+    const source: { id: string; name: string; code: string }[] =
+      roster.length > 0
+        ? roster.map((entry) => ({ id: entry.dealerId, name: entry.dealerName, code: entry.dealerCode }))
+        : (data?.dealerStatuses ?? []).map((status) => ({
+            id: status.dealerId,
+            name: status.dealerName,
+            code: status.dealerCode,
+          }));
     const seen = new Set<string>();
     const list: { id: string; name: string; code: string; color: string }[] = [];
-    (data?.dealerStatuses ?? []).forEach((status) => {
-      if (seen.has(status.dealerId)) return;
-      seen.add(status.dealerId);
+    source.forEach((entry) => {
+      if (seen.has(entry.id)) return;
+      seen.add(entry.id);
       list.push({
-        id: status.dealerId,
-        name: status.dealerName,
-        code: status.dealerCode,
+        id: entry.id,
+        name: entry.name,
+        code: entry.code,
         color: getDealerColor(list.length),
       });
     });
     return list;
-  }, [data]);
+  }, [roster, data]);
 
   const handleFilterChange = React.useCallback(
     (patch: Partial<CustomerMapFilterState>) => {
@@ -268,9 +279,9 @@ export default function CustomerMapPage() {
   const { data: boundaryHighlight } = useBoundaryFeature(boundarySelection);
 
   if (isLoading && !data) return <CustomerMapSkeleton />;
-  if (error) return <ErrorPage message={error} onRefresh={refresh} />;
+  if (error) return <ErrorPage message={error} onRefresh={() => void refresh({ bypassCache: true })} />;
   if (data && !data.success) {
-    return <ErrorPage message={data.error ?? "Failed to load the customer map"} onRefresh={refresh} />;
+    return <ErrorPage message={data.error ?? "Failed to load the customer map"} onRefresh={() => void refresh({ bypassCache: true })} />;
   }
 
   const filterProps = {
@@ -303,6 +314,7 @@ export default function CustomerMapPage() {
         dealers={dealers}
         dealerStatuses={data?.dealerStatuses ?? []}
         perDealerCounts={perDealerCounts}
+        dealerStates={dealerStates}
         markerStyle={markerStyle}
         basemap={basemap}
         boundaryHighlight={boundaryHighlight}
@@ -321,7 +333,7 @@ export default function CustomerMapPage() {
         <Button
           variant="outline"
           size="sm"
-          onClick={refresh}
+          onClick={() => void refresh({ bypassCache: true })}
           disabled={isLoading}
           className="h-9 shrink-0 gap-2"
           title="Refresh data"
