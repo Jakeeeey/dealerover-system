@@ -135,8 +135,6 @@ export interface CustomerMapFilterState {
   brgy: string;
   storeTypeName: string;
   classificationName: string;
-  priceType: string;
-  paymentTerm: string;
   search: string;
 }
 
@@ -147,8 +145,6 @@ export const EMPTY_CUSTOMER_MAP_FILTERS: CustomerMapFilterState = {
   brgy: "",
   storeTypeName: "",
   classificationName: "",
-  priceType: "",
-  paymentTerm: "",
   search: "",
 };
 

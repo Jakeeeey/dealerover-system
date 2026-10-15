@@ -3,7 +3,7 @@
 import * as React from "react";
 import { Search } from "lucide-react";
 import { Input } from "@/components/ui/input";
-import { cn } from "@/lib/utils";
+import { cn, formatNumber } from "@/lib/utils";
 import type { CustomerMapFilterState } from "../types";
 import {
   DealerFilterCombobox,
@@ -16,13 +16,19 @@ export interface CustomerMapFilterProps {
   onChange: (patch: Partial<CustomerMapFilterState>) => void;
   onReset: () => void;
   dealers: DealerFilterOption[];
+  /** Dealer whose assigned territory (scope) is outlined. "" = none. */
+  scopeDealerId: string;
+  onScopeDealerChange: (dealerId: string) => void;
+  /** Scope entries that could not be matched to a boundary — surfaced, never silent. */
+  scopeUnresolved?: string[];
+  /** Customers outside the active territory, and the total drawn. */
+  scopeOutside?: number;
+  scopeTotal?: number;
   provinceOptions: string[];
   cityOptions: string[];
   brgyOptions: string[];
   storeTypeOptions: string[];
   classificationOptions: string[];
-  priceTypeOptions: string[];
-  paymentTermOptions: string[];
   resultCount: number;
   disabled?: boolean;
 }
@@ -45,23 +51,40 @@ export function countActiveFilters(filters: CustomerMapFilterState): number {
   if (filters.brgy) count += 1;
   if (filters.storeTypeName) count += 1;
   if (filters.classificationName) count += 1;
-  if (filters.priceType) count += 1;
-  if (filters.paymentTerm) count += 1;
   if (filters.search.trim()) count += 1;
   return count;
+}
+
+/**
+ * Whether Reset has anything to do. The dealer scope is deliberately NOT a
+ * filter — it never narrows the rows, so it stays out of the count above — but
+ * Reset does clear it. This keeps the button honest: without it the control
+ * reads inert whenever a scope is the only thing set, while pressing it would
+ * in fact clear the territory.
+ */
+export function hasResetableState(
+  filters: CustomerMapFilterState,
+  scopeDealerId: string,
+): boolean {
+  return countActiveFilters(filters) > 0 || scopeDealerId !== "";
 }
 
 interface FieldProps {
   filters: CustomerMapFilterState;
   onChange: (patch: Partial<CustomerMapFilterState>) => void;
   dealers: DealerFilterOption[];
+  /** Dealer whose assigned territory (scope) is outlined. "" = none. */
+  scopeDealerId: string;
+  onScopeDealerChange: (dealerId: string) => void;
+  scopeUnresolved?: string[];
+  /** Customers outside the active territory, and the total drawn. */
+  scopeOutside?: number;
+  scopeTotal?: number;
   provinceOptions: string[];
   cityOptions: string[];
   brgyOptions: string[];
   storeTypeOptions: string[];
   classificationOptions: string[];
-  priceTypeOptions: string[];
-  paymentTermOptions: string[];
   disabled: boolean;
   stacked: boolean;
 }
@@ -85,6 +108,61 @@ function DealerField({ filters, onChange, dealers, disabled, stacked }: FieldPro
         disabled={disabled}
         className={width(stacked, "w-44")}
       />
+    </div>
+  );
+}
+
+/**
+ * The dealer's assigned territory (their `dealer_scope` rows) drawn on the map.
+ * Deliberately NOT part of `filters`: it does not narrow the customer set, it
+ * outlines where that dealer is meant to sell — so it clears from its own
+ * "No scope" row and survives Reset, which only clears filters.
+ */
+function ScopeField({
+  dealers,
+  scopeDealerId,
+  onScopeDealerChange,
+  scopeUnresolved,
+  scopeOutside,
+  scopeTotal,
+  disabled,
+  stacked,
+}: FieldProps) {
+  const options = dealers.map((dealer) => ({ value: dealer.id, label: dealer.name }));
+  const missing = scopeUnresolved ?? [];
+  return (
+    <div className={stacked ? "w-full" : undefined}>
+      <label className={labelClass(stacked)}>Scope</label>
+      <FilterCombobox
+        className={width(stacked, "w-44")}
+        placeholder="Scope"
+        allLabel="No scope"
+        options={options}
+        value={scopeDealerId}
+        onChange={onScopeDealerChange}
+        disabled={disabled}
+      />
+      {missing.length > 0 ? (
+        <p className="mt-1 text-[11px] leading-tight text-warning">
+          {formatNumber(missing.length)} scope area{missing.length === 1 ? "" : "s"} not found in the
+          boundary data: {missing.join(", ")}
+        </p>
+      ) : scopeDealerId && scopeOutside !== undefined && scopeTotal !== undefined ? (
+        <p
+          className={cn(
+            "mt-1 text-[11px] leading-tight",
+            scopeOutside > 0 ? "font-medium text-destructive" : "text-muted-foreground",
+          )}
+        >
+          {scopeOutside > 0
+            ? `${formatNumber(scopeOutside)} of ${formatNumber(scopeTotal)} customers outside this territory`
+            : `All ${formatNumber(scopeTotal)} customers inside this territory`}
+        </p>
+      ) : (
+        <p className="mt-1 text-[11px] leading-tight text-muted-foreground">
+          A dealer&apos;s territory and its customers.
+        </p>
+      )}
     </div>
   );
 }
@@ -136,9 +214,6 @@ function BrgyField({ filters, onChange, brgyOptions, disabled, stacked }: FieldP
         onChange={(value) => onChange({ brgy: value })}
         disabled={disabled || !filters.city}
       />
-      <p className="mt-1 text-[11px] leading-tight text-muted-foreground">
-        Province, city &amp; barangay are derived from the map location.
-      </p>
     </div>
   );
 }
@@ -183,46 +258,6 @@ function ClassificationField({
   );
 }
 
-function PriceTypeField({ filters, onChange, priceTypeOptions, disabled, stacked }: FieldProps) {
-  return (
-    <div className={stacked ? "w-full" : undefined}>
-      <label className={labelClass(stacked)}>Price type</label>
-      <FilterCombobox
-        className={width(stacked, "w-36")}
-        placeholder="Price type"
-        allLabel="All price types"
-        options={toOptions(priceTypeOptions)}
-        value={filters.priceType}
-        onChange={(value) => onChange({ priceType: value })}
-        disabled={disabled}
-      />
-    </div>
-  );
-}
-
-function PaymentTermField({
-  filters,
-  onChange,
-  paymentTermOptions,
-  disabled,
-  stacked,
-}: FieldProps) {
-  return (
-    <div className={stacked ? "w-full" : undefined}>
-      <label className={labelClass(stacked)}>Payment term</label>
-      <FilterCombobox
-        className={width(stacked, "w-36")}
-        placeholder="Payment term"
-        allLabel="All terms"
-        options={toOptions(paymentTermOptions)}
-        value={filters.paymentTerm}
-        onChange={(value) => onChange({ paymentTerm: value })}
-        disabled={disabled}
-      />
-    </div>
-  );
-}
-
 function SearchField({ filters, onChange, disabled, stacked }: FieldProps) {
   return (
     <div className={stacked ? "w-full" : undefined}>
@@ -254,14 +289,13 @@ export function FilterFields(props: FilterFieldsProps) {
   const fieldProps: FieldProps = { ...props, disabled, stacked };
   return (
     <>
+      <ScopeField {...fieldProps} />
       <DealerField {...fieldProps} />
       <ProvinceField {...fieldProps} />
       <CityField {...fieldProps} />
       <BrgyField {...fieldProps} />
       <StoreTypeField {...fieldProps} />
       <ClassificationField {...fieldProps} />
-      <PriceTypeField {...fieldProps} />
-      <PaymentTermField {...fieldProps} />
       <SearchField {...fieldProps} />
     </>
   );
@@ -287,6 +321,7 @@ export function GroupedFilterFields(props: CustomerMapFilterProps) {
     <>
       <section aria-label="Location filters" className="flex flex-col gap-3">
         <SectionHeading>Location</SectionHeading>
+        <ScopeField {...fieldProps} />
         <DealerField {...fieldProps} />
         <ProvinceField {...fieldProps} />
         <CityField {...fieldProps} />
@@ -299,8 +334,6 @@ export function GroupedFilterFields(props: CustomerMapFilterProps) {
         <SectionHeading>Attributes</SectionHeading>
         <StoreTypeField {...fieldProps} />
         <ClassificationField {...fieldProps} />
-        <PriceTypeField {...fieldProps} />
-        <PaymentTermField {...fieldProps} />
       </section>
 
       <SearchField {...fieldProps} />

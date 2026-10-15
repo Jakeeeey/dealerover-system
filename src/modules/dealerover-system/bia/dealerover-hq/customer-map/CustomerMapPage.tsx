@@ -16,6 +16,7 @@ import {
 } from "./types";
 import { useCustomerMap } from "./hooks/useCustomerMap";
 import { useBoundaryFeature, type BoundarySelection } from "./hooks/useBoundaryFeature";
+import { useDealerScope } from "./hooks/useDealerScope";
 import { useFullscreen } from "./hooks/useFullscreen";
 import { CustomerMapFilters } from "./components/CustomerMapFilters";
 import { CustomerMapSidebar } from "./components/CustomerMapSidebar";
@@ -24,6 +25,7 @@ import { CustomerMapSkeleton } from "./components/CustomerMapSkeleton";
 import { CustomerMapView } from "./components/CustomerMapView";
 import { MapStageContext } from "./components/MapStageContext";
 import { getDealerColor } from "./utils/dealer-colors";
+import { isInsideScope, scopeAreasFrom } from "./utils/area-match";
 
 const MARKER_STORAGE_KEY = "hq-customer-map-marker";
 const BASEMAP_STORAGE_KEY = "hq-customer-map-basemap";
@@ -44,6 +46,10 @@ export default function CustomerMapPage() {
   const [filters, setFilters] = React.useState<CustomerMapFilterState>({
     ...EMPTY_CUSTOMER_MAP_FILTERS,
   });
+  // Which dealer's assigned territory (their `dealer_scope` rows) is outlined.
+  // Deliberately NOT part of `filters`: it outlines the map, it does not narrow
+  // the customer rows — so Reset leaves it alone and its own combobox clears it.
+  const [scopeDealerId, setScopeDealerId] = React.useState("");
 
   // Map presentation preferences: marker style + basemap theme (both persisted).
   const [markerStyle, setMarkerStyle] = React.useState<CustomerMapMarkerStyle>(
@@ -154,12 +160,37 @@ export default function CustomerMapPage() {
 
         return next;
       });
+
+      // A Location filter and a dealer scope both answer "where on the map",
+      // and they fight over the framing — so picking one drops the other. Only
+      // a SET field triggers this; clearing one never does. The dealer filter is
+      // deliberately untouched: scope + dealer filter together IS the
+      // out-of-territory check.
+      if ("province" in patch || "city" in patch || "brgy" in patch) {
+        if (patch.province || patch.city || patch.brgy) setScopeDealerId("");
+      }
     },
     [activeCustomers],
   );
 
+  const handleScopeDealerChange = React.useCallback(
+    (dealerId: string) => {
+      setScopeDealerId(dealerId);
+      if (!dealerId) return;
+      // Selecting a scope is a "show me this dealer's world" gesture, so it also
+      // narrows the map to that dealer — the common case. This does NOT disable
+      // the dealer multi-select: it pre-fills the very same array the combobox
+      // edits, so adding or removing dealers afterwards behaves normally, and
+      // clearing the scope deliberately leaves the dealer filter untouched (it
+      // stays visible in its own control rather than vanishing).
+      handleFilterChange({ dealerIds: [dealerId], province: "", city: "", brgy: "" });
+    },
+    [handleFilterChange],
+  );
+
   const handleReset = React.useCallback(() => {
     setFilters({ ...EMPTY_CUSTOMER_MAP_FILTERS });
+    setScopeDealerId("");
   }, []);
 
   // Legend chip toggle: flips one dealer's membership (empty array = all).
@@ -215,15 +246,6 @@ export default function CustomerMapPage() {
     () => uniqueSorted(scopedCustomers.map((customer) => customer.classification_name)),
     [scopedCustomers],
   );
-  const priceTypeOptions = React.useMemo(
-    () => uniqueSorted(scopedCustomers.map((customer) => customer.price_type)),
-    [scopedCustomers],
-  );
-  const paymentTermOptions = React.useMemo(
-    () => uniqueSorted(scopedCustomers.map((customer) => customer.payment_term)),
-    [scopedCustomers],
-  );
-
   const filteredCustomers = React.useMemo(() => {
     const query = filters.search.trim().toLowerCase();
     return activeCustomers.filter((customer) => {
@@ -235,8 +257,6 @@ export default function CustomerMapPage() {
       if (filters.classificationName && customer.classification_name !== filters.classificationName) {
         return false;
       }
-      if (filters.priceType && customer.price_type !== filters.priceType) return false;
-      if (filters.paymentTerm && customer.payment_term !== filters.paymentTerm) return false;
       if (query) {
         const haystack = `${customer.customer_name} ${customer.customer_code} ${customer.store_name}`.toLowerCase();
         if (!haystack.includes(query)) return false;
@@ -277,6 +297,23 @@ export default function CustomerMapPage() {
     return null;
   }, [filters.brgy, filters.city, filters.province]);
   const { data: boundaryHighlight } = useBoundaryFeature(boundarySelection);
+  const dealerScope = useDealerScope(scopeDealerId || null);
+
+  // Territory check. The scope's areas are read off the geometry the hook has
+  // already fetched — each boundary feature carries its level and name — so it
+  // costs no second request. A customer counts as outside when its DERIVED admin
+  // name at an area's own level matches none of them, compared with the same
+  // tolerant rules the server uses to find the boundary in the first place.
+  // NOTE: these run BEFORE the early returns below, like every other hook.
+  const scopeAreas = React.useMemo(() => scopeAreasFrom(dealerScope.data), [dealerScope.data]);
+  const outsideKeys = React.useMemo(() => {
+    const keys = new Set<string>();
+    if (scopeAreas.length === 0) return keys;
+    for (const customer of filteredCustomers) {
+      if (!isInsideScope(customer, scopeAreas)) keys.add(customer.key);
+    }
+    return keys;
+  }, [filteredCustomers, scopeAreas]);
 
   if (isLoading && !data) return <CustomerMapSkeleton />;
   if (error) return <ErrorPage message={error} onRefresh={() => void refresh({ bypassCache: true })} />;
@@ -289,13 +326,16 @@ export default function CustomerMapPage() {
     onChange: handleFilterChange,
     onReset: handleReset,
     dealers,
+    scopeDealerId,
+    onScopeDealerChange: handleScopeDealerChange,
+    scopeUnresolved: dealerScope.unresolved,
+    scopeOutside: outsideKeys.size,
+    scopeTotal: filteredCustomers.length,
     provinceOptions,
     cityOptions,
     brgyOptions,
     storeTypeOptions,
     classificationOptions,
-    priceTypeOptions,
-    paymentTermOptions,
     resultCount: filteredCustomers.length,
     disabled: isLoading,
   };
@@ -317,6 +357,8 @@ export default function CustomerMapPage() {
         dealerStates={dealerStates}
         markerStyle={markerStyle}
         basemap={basemap}
+        scopeHighlight={dealerScope.data}
+        outsideKeys={outsideKeys}
         boundaryHighlight={boundaryHighlight}
         selectedDealerIds={filters.dealerIds}
         onToggleDealer={handleToggleDealer}
