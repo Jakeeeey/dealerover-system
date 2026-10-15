@@ -21,6 +21,9 @@ export interface CustomerMapFilterProps {
   onScopeDealerChange: (dealerId: string) => void;
   /** Scope entries that could not be matched to a boundary — surfaced, never silent. */
   scopeUnresolved?: string[];
+  /** Customers outside the active territory, and the total drawn. */
+  scopeOutside?: number;
+  scopeTotal?: number;
   provinceOptions: string[];
   cityOptions: string[];
   brgyOptions: string[];
@@ -74,6 +77,9 @@ interface FieldProps {
   scopeDealerId: string;
   onScopeDealerChange: (dealerId: string) => void;
   scopeUnresolved?: string[];
+  /** Customers outside the active territory, and the total drawn. */
+  scopeOutside?: number;
+  scopeTotal?: number;
   provinceOptions: string[];
   cityOptions: string[];
   brgyOptions: string[];
@@ -117,6 +123,8 @@ function ScopeField({
   scopeDealerId,
   onScopeDealerChange,
   scopeUnresolved,
+  scopeOutside,
+  scopeTotal,
   disabled,
   stacked,
 }: FieldProps) {
@@ -134,10 +142,21 @@ function ScopeField({
         onChange={onScopeDealerChange}
         disabled={disabled}
       />
-      {scopeDealerId && missing.length > 0 ? (
+      {missing.length > 0 ? (
         <p className="mt-1 text-[11px] leading-tight text-warning">
           {formatNumber(missing.length)} scope area{missing.length === 1 ? "" : "s"} not found in the
           boundary data: {missing.join(", ")}
+        </p>
+      ) : scopeDealerId && scopeOutside !== undefined && scopeTotal !== undefined ? (
+        <p
+          className={cn(
+            "mt-1 text-[11px] leading-tight",
+            scopeOutside > 0 ? "font-medium text-destructive" : "text-muted-foreground",
+          )}
+        >
+          {scopeOutside > 0
+            ? `${formatNumber(scopeOutside)} of ${formatNumber(scopeTotal)} customers outside this territory`
+            : `All ${formatNumber(scopeTotal)} customers inside this territory`}
         </p>
       ) : (
         <p className="mt-1 text-[11px] leading-tight text-muted-foreground">

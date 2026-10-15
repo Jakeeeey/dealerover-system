@@ -30,6 +30,11 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import {
+  areaNamesMatch,
+  normalizeArea,
+} from "../utils/area-match";
+
 export type BoundaryLevel = "province" | "city" | "barangay";
 
 export interface AdminResolution {
@@ -111,35 +116,9 @@ function normalizeName(value: string): string {
   return value.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
-/**
- * Normalizes an area name for tolerant matching: lower-case, strip punctuation,
- * drop administrative qualifiers ("city", "municipality", "mun", "of", "capital").
- * @param {string} value - Raw area name.
- * @returns {string} Normalized name for tolerant comparison.
- */
-function normalizeArea(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[().,'"]/g, " ")
-    .replace(/\b(city|municipality|mun|of|capital)\b/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-/**
- * True when two area names refer to the same place (tolerating "City of X" / "X City").
- * @param {string} a - First area name.
- * @param {string} b - Second area name.
- * @returns {boolean} True when the names match tolerantly.
- */
-function areaNamesMatch(a: string, b: string): boolean {
-  const na = normalizeArea(a);
-  const nb = normalizeArea(b);
-  if (!na || !nb) return false;
-  if (na === nb) return true;
-  // One is a word-prefix of the other (e.g. "dagupan" vs "dagupan proper").
-  return na.startsWith(`${nb} `) || nb.startsWith(`${na} `);
-}
+// normalizeArea / areaNamesMatch live in ../utils/area-match so the client-side
+// territory check (which cannot import this server-only module) compares names
+// by exactly the same rules.
 
 function isNumberPair(value: unknown): value is [number, number] {
   return (

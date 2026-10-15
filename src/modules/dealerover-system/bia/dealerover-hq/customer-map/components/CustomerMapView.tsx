@@ -36,6 +36,13 @@ const CLUSTER_SOURCE_ID = "customer-points-cluster";
 const CLUSTER_CIRCLE_ID = "customer-cluster-circles";
 const CLUSTER_COUNT_ID = "customer-cluster-count";
 const CLUSTER_POINT_ID = "customer-cluster-points";
+/** Out-of-territory markers: a stacked, blurred red halo UNDER the dots. The
+ * falloff reads as a gradient glow; a crisp stroke was tried and looked like an
+ * outline pasted onto the marker. */
+const OUTSIDE_GLOW_FAR_ID = "customer-outside-glow-far";
+const OUTSIDE_GLOW_MID_ID = "customer-outside-glow-mid";
+const OUTSIDE_GLOW_NEAR_ID = "customer-outside-glow-near";
+const OUTSIDE_GLOW_IDS = [OUTSIDE_GLOW_FAR_ID, OUTSIDE_GLOW_MID_ID, OUTSIDE_GLOW_NEAR_ID];
 
 // Boundary highlighting runs as TWO groups sharing ONE dim mask:
 //   - BOUNDARY_* below is the dealer's SCOPE (their territory) and gets the full
@@ -47,6 +54,8 @@ const CLUSTER_POINT_ID = "customer-cluster-points";
 const BOUNDARY_SOURCE_ID = "boundary-highlight";
 const DIM_SOURCE_ID = "boundary-dim-mask";
 const DIM_ID = "boundary-dim";
+/** The faded red wash laid OVER the black shade — never instead of it. */
+const DIM_WASH_ID = "boundary-dim-red";
 const TINT_ID = "boundary-tint";
 const GLOW_FAR_ID = "boundary-glow-far";
 const GLOW_NEAR_ID = "boundary-glow-near";
@@ -56,6 +65,7 @@ const LINE_ID = "boundary-line";
 const CORE_ID = "boundary-core";
 const BOUNDARY_LAYER_IDS = [
   DIM_ID,
+  DIM_WASH_ID,
   TINT_ID,
   GLOW_FAR_ID,
   GLOW_NEAR_ID,
@@ -76,6 +86,12 @@ const BOUNDARY_SMOOTHING_ITERATIONS = 1;
 /** Rings smaller than this absolute signed area (deg²) are dropped from the
  * highlight + dim mask, so tiny coastal islets/inlets no longer spray glow. */
 const MIN_HIGHLIGHT_RING_AREA = 2e-6;
+
+/** Opacity of the red wash laid over the black territory shade. The shade does
+ * the darkening and the red only casts it — with the shade this deep, very
+ * little basemap survives, so the cast reads as an already-dark red rather than
+ * a bright one. Raise for more red, drop to 0 for a neutral black shade. */
+const DIM_WASH_OPACITY = 0.1;
 
 /** Loose GeoJSON boundary payload served by the boundary API route. */
 export interface BoundaryHighlightGeometry {
@@ -169,6 +185,8 @@ interface CustomerMapViewProps {
   scopeHighlight?: BoundaryHighlight | null;
   /** The Location filter's area (null = none). Drives the quiet dashed annotation. */
   boundaryHighlight?: BoundaryHighlight | null;
+  /** Customer keys outside the active dealer scope — drives the red glow. */
+  outsideKeys?: ReadonlySet<string>;
   /** Dealer ids in the filter (empty = all). Drives legend chip toggle state. */
   selectedDealerIds: string[];
   /** Flips one dealer's membership in the filter (empty array = all). */
@@ -185,11 +203,16 @@ interface CustomerMapViewProps {
  * (~15 m) so a stack reads as several distinct dots — sub-pixel when zoomed out
  * (so it never clutters) and a visible rosette as you zoom in. Cluster/heat
  * sources pass `jitter:false` so their aggregation uses the true positions.
+ * `outsideKeys` marks customers outside the active dealer scope. The flag rides
+ * on the feature rather than in a second source on purpose: bucketing a subset
+ * separately would fan its jitter differently, so a glow would sit beside its
+ * dot instead of around it.
  */
 function buildMappableData(
   customers: CustomerMapRow[],
   colors: Record<string, string>,
   jitter = false,
+  outsideKeys?: ReadonlySet<string>,
 ): MappableData {
   const groups = new Map<string, number[]>();
   customers.forEach((customer, index) => {
@@ -240,6 +263,7 @@ function buildMappableData(
         priceType: customer.price_type,
         paymentTerm: customer.payment_term,
         isActive: customer.isActive,
+        outsideScope: outsideKeys !== undefined && outsideKeys.has(customer.key),
       },
     })),
   } as MappableData;
@@ -498,26 +522,27 @@ function hslToHex(h: number, s: number, l: number): string {
 }
 
 /**
- * Reads the theme accent at runtime so the glow border matches light/dark.
+ * Reads a theme token at runtime so canvas paints match light/dark.
  * NOTE: MapLibre paints live on a WebGL canvas, which cannot consume CSS
  * theme tokens (same reason the dealer palette uses explicit values) — the
- * theme value is resolved to a concrete colour here, with a hex fallback.
+ * token is resolved to a concrete colour here, with a fallback.
+ * @param {string} token - CSS custom property name, e.g. "--primary".
+ * @param {string} fallback - Colour used when the token is missing/unparsable.
  * @returns {string} A MapLibre-compatible colour string.
  */
-function resolveAccentColor(): string {
-  const FALLBACK = "#1D4ED8";
+function resolveTokenColor(token: string, fallback: string): string {
   try {
-    const raw = getComputedStyle(document.documentElement).getPropertyValue("--primary").trim();
-    if (!raw) return FALLBACK;
+    const raw = getComputedStyle(document.documentElement).getPropertyValue(token).trim();
+    if (!raw) return fallback;
     if (/^#[0-9a-fA-F]{6}$/.test(raw)) return raw;
     if (/^rgba?\(/.test(raw) || /^hsla?\(/.test(raw)) return raw;
     const triplet = raw.match(/^([\d.]+)\s+([\d.]+)%\s+([\d.]+)%$/);
     if (triplet) {
       return hslToHex(Number(triplet[1]), Number(triplet[2]), Number(triplet[3]));
     }
-    return FALLBACK;
+    return fallback;
   } catch {
-    return FALLBACK;
+    return fallback;
   }
 }
 
@@ -560,6 +585,13 @@ function applyBoundaryLayers(
 
   // The mask is the one piece that must be REMOVED rather than emptied: with no
   // holes it would wash the entire world.
+  // Territory wash: a BLACK shade with a faded red wash over it. The shade does
+  // the darkening, the red only casts it — one pre-mixed colour could not tell
+  // the two apart, and mixing them at full strength turned the whole map red.
+  // Two layers keep either half dialable (DIM_WASH_OPACITY). The wash's paint is
+  // re-set every apply so a theme flip re-tones the red without a basemap swap.
+  const washColor = resolveTokenColor("--destructive", "#B91C1C");
+
   if (mask) {
     setSourceData(DIM_SOURCE_ID, mask);
     if (!map.getLayer(DIM_ID)) {
@@ -569,20 +601,33 @@ function applyBoundaryLayers(
         source: DIM_SOURCE_ID,
         // Near-black wash so everything outside the highlighted areas is heavily
         // darkened.
-        paint: { "fill-color": "#000000", "fill-opacity": 0.85 },
+        paint: { "fill-color": "#000000", "fill-opacity": 0.92 },
       });
     }
-  } else if (map.getLayer(DIM_ID)) {
-    try {
-      map.removeLayer(DIM_ID);
-    } catch {
-      // Layer already gone with a style swap — nothing to do.
+    if (!map.getLayer(DIM_WASH_ID)) {
+      map.addLayer({
+        id: DIM_WASH_ID,
+        type: "fill",
+        source: DIM_SOURCE_ID,
+        paint: { "fill-color": washColor, "fill-opacity": DIM_WASH_OPACITY },
+      });
+    } else {
+      map.setPaintProperty(DIM_WASH_ID, "fill-color", washColor);
+    }
+  } else {
+    for (const id of [DIM_ID, DIM_WASH_ID]) {
+      if (!map.getLayer(id)) continue;
+      try {
+        map.removeLayer(id);
+      } catch {
+        // Layer already gone with a style swap — nothing to do.
+      }
     }
   }
 
-  // Canvas paints (see resolveAccentColor) — re-read every apply so a
-  // light/dark flip re-tones the glow without a basemap swap.
-  const accent = resolveAccentColor();
+  // Canvas paints (see resolveTokenColor) — re-read every apply so a light/dark
+  // flip re-tones the glow without a basemap swap.
+  const accent = resolveTokenColor("--primary", "#1D4ED8");
   if (!map.getLayer(TINT_ID)) {
     map.addLayer({
       id: TINT_ID,
@@ -691,6 +736,7 @@ function applyBoundaryLayers(
   for (const id of [
     ...BOUNDARY_LAYER_IDS,
     ...LOCATION_LAYER_IDS,
+    ...OUTSIDE_GLOW_IDS,
     HEAT_ID,
     CIRCLE_ID,
     CLUSTER_CIRCLE_ID,
@@ -792,6 +838,7 @@ export function CustomerMapView({
   basemap,
   scopeHighlight = null,
   boundaryHighlight = null,
+  outsideKeys,
   selectedDealerIds,
   onToggleDealer,
   dealerStates = {},
@@ -831,8 +878,9 @@ export function CustomerMapView({
     markerStyle,
     scopeHighlight,
     boundaryHighlight,
+    outsideKeys,
   });
-  latest.current = { customers, colors, markerStyle, scopeHighlight, boundaryHighlight };
+  latest.current = { customers, colors, markerStyle, scopeHighlight, boundaryHighlight, outsideKeys };
 
   // (Re)builds the source + layers and applies visibility. Called on the initial
   // style load, after every basemap style swap, and on data/style changes. No
@@ -842,7 +890,7 @@ export function CustomerMapView({
     const state = latest.current;
     try {
       // Dots fan stacked customers out (jitter); clusters keep true positions.
-      const data = buildMappableData(state.customers, state.colors, true);
+      const data = buildMappableData(state.customers, state.colors, true, state.outsideKeys);
       const clusterData = buildMappableData(state.customers, state.colors, false);
       const existing = map.getSource(SOURCE_ID) as GeoJSONSource | undefined;
       if (!existing) map.addSource(SOURCE_ID, { type: "geojson", data });
@@ -911,7 +959,7 @@ export function CustomerMapView({
           source: CLUSTER_SOURCE_ID,
           filter: ["has", "point_count"],
           paint: {
-            // Canvas paints (see resolveAccentColor) — explicit Okabe–Ito-ish
+            // Canvas paints (see resolveTokenColor) — explicit Okabe–Ito-ish
             // steps by cluster size; theme tokens cannot reach WebGL.
             "circle-color": ["step", ["get", "point_count"], "#0072B2", 10, "#E69F00", 50, "#D55E00"],
             "circle-radius": ["step", ["get", "point_count"], 15, 10, 20, 50, 26],
@@ -965,6 +1013,49 @@ export function CustomerMapView({
       show(CLUSTER_CIRCLE_ID, isClusters);
       show(CLUSTER_COUNT_ID, isClusters);
       show(CLUSTER_POINT_ID, isClusters);
+
+      // Out-of-territory glow — for spotting sales that leave a dealer's area.
+      // Three stacked blurred circles over the DOTS source (so a bloom lands on
+      // its own jittered dot), widest and faintest first: the falloff reads as a
+      // gradient glow, and the point keeps its own dealer colour because the
+      // halo sits UNDER it. Hidden entirely when nothing is outside.
+      const outsideColor = resolveTokenColor("--destructive", "#B91C1C");
+      const passes = [
+        { id: OUTSIDE_GLOW_FAR_ID, radius: 34, opacity: 0.32 },
+        { id: OUTSIDE_GLOW_MID_ID, radius: 22, opacity: 0.45 },
+        { id: OUTSIDE_GLOW_NEAR_ID, radius: 13, opacity: 0.62 },
+      ];
+      for (const pass of passes) {
+        if (map.getLayer(pass.id)) continue;
+        map.addLayer({
+          id: pass.id,
+          type: "circle",
+          source: SOURCE_ID,
+          filter: ["==", ["get", "outsideScope"], true],
+          paint: {
+            "circle-color": outsideColor,
+            "circle-radius": [
+              "interpolate",
+              ["linear"],
+              ["zoom"],
+              4,
+              pass.radius * 0.6,
+              12,
+              pass.radius,
+              16,
+              pass.radius * 1.4,
+            ],
+            "circle-blur": 1,
+            "circle-opacity": pass.opacity,
+          },
+        });
+      }
+      // A recoloured outline (the dot's own stroke turned red) was tried and
+      // removed: where several out-of-territory customers sit close together the
+      // rims overlapped into a red tangle, so the bloom alone carries the signal
+      // and the dot keeps its dealer colour untouched.
+      const hasOutside = (state.outsideKeys?.size ?? 0) > 0;
+      for (const id of OUTSIDE_GLOW_IDS) show(id, hasOutside);
 
       applyBoundaryLayers(map, state.scopeHighlight, state.boundaryHighlight);
     } catch {

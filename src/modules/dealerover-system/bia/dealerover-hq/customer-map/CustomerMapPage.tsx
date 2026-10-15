@@ -25,6 +25,7 @@ import { CustomerMapSkeleton } from "./components/CustomerMapSkeleton";
 import { CustomerMapView } from "./components/CustomerMapView";
 import { MapStageContext } from "./components/MapStageContext";
 import { getDealerColor } from "./utils/dealer-colors";
+import { isInsideScope, scopeAreasFrom } from "./utils/area-match";
 
 const MARKER_STORAGE_KEY = "hq-customer-map-marker";
 const BASEMAP_STORAGE_KEY = "hq-customer-map-basemap";
@@ -298,6 +299,22 @@ export default function CustomerMapPage() {
   const { data: boundaryHighlight } = useBoundaryFeature(boundarySelection);
   const dealerScope = useDealerScope(scopeDealerId || null);
 
+  // Territory check. The scope's areas are read off the geometry the hook has
+  // already fetched — each boundary feature carries its level and name — so it
+  // costs no second request. A customer counts as outside when its DERIVED admin
+  // name at an area's own level matches none of them, compared with the same
+  // tolerant rules the server uses to find the boundary in the first place.
+  // NOTE: these run BEFORE the early returns below, like every other hook.
+  const scopeAreas = React.useMemo(() => scopeAreasFrom(dealerScope.data), [dealerScope.data]);
+  const outsideKeys = React.useMemo(() => {
+    const keys = new Set<string>();
+    if (scopeAreas.length === 0) return keys;
+    for (const customer of filteredCustomers) {
+      if (!isInsideScope(customer, scopeAreas)) keys.add(customer.key);
+    }
+    return keys;
+  }, [filteredCustomers, scopeAreas]);
+
   if (isLoading && !data) return <CustomerMapSkeleton />;
   if (error) return <ErrorPage message={error} onRefresh={() => void refresh({ bypassCache: true })} />;
   if (data && !data.success) {
@@ -312,6 +329,8 @@ export default function CustomerMapPage() {
     scopeDealerId,
     onScopeDealerChange: handleScopeDealerChange,
     scopeUnresolved: dealerScope.unresolved,
+    scopeOutside: outsideKeys.size,
+    scopeTotal: filteredCustomers.length,
     provinceOptions,
     cityOptions,
     brgyOptions,
@@ -339,6 +358,7 @@ export default function CustomerMapPage() {
         markerStyle={markerStyle}
         basemap={basemap}
         scopeHighlight={dealerScope.data}
+        outsideKeys={outsideKeys}
         boundaryHighlight={boundaryHighlight}
         selectedDealerIds={filters.dealerIds}
         onToggleDealer={handleToggleDealer}
