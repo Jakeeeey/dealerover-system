@@ -648,3 +648,79 @@ export function getBoundary(
   }
   return { type: "FeatureCollection", features: matches };
 }
+
+export interface ScopeArea {
+  level: BoundaryLevel;
+  name: string;
+  /** Parent province hint — required for a barangay entry, also disambiguates same-named cities. */
+  parentProvince?: string;
+  /** Parent city hint — disambiguates same-named barangays. */
+  parentCity?: string;
+}
+
+export interface ScopeBoundaryResult {
+  featureCollection: BoundaryFeatureCollection;
+  resolved: ScopeArea[];
+  unresolved: ScopeArea[];
+}
+
+/**
+ * Builds the dedupe key for one scope entry. Names are compared tolerantly
+ * ("Dagupan City" vs "dagupan") so the same territory listed twice under
+ * different spellings still collapses to one entry instead of double-drawing.
+ * @param {ScopeArea} area - Dealer scope entry.
+ * @returns {string} Normalized level + name + parents key.
+ */
+function scopeAreaKey(area: ScopeArea): string {
+  const level = typeof area?.level === "string" ? area.level : "";
+  const name = typeof area?.name === "string" ? area.name : "";
+  const city = typeof area?.parentCity === "string" ? area.parentCity : "";
+  const province = typeof area?.parentProvince === "string" ? area.parentProvince : "";
+  return `${level}|${normalizeArea(name)}|${normalizeArea(city)}|${normalizeArea(province)}`;
+}
+
+/**
+ * Merges every area of a dealer's scope into ONE FeatureCollection; never throws.
+ * Each entry resolves through the standard `getBoundary` path (so province/city
+ * eager indexes and the barangay manifest + LRU are reused, not reimplemented);
+ * entries with no geometry land in `unresolved` for the "not drawn" notice.
+ * @param {ScopeArea[]} areas - A dealer's assigned territory entries.
+ * @returns {ScopeBoundaryResult} Merged collection (input order) + resolved/unresolved split.
+ */
+export function getScopeBoundary(areas: ScopeArea[]): ScopeBoundaryResult {
+  const none: ScopeBoundaryResult = {
+    featureCollection: { type: "FeatureCollection", features: [] },
+    resolved: [],
+    unresolved: [],
+  };
+  if (!Array.isArray(areas) || areas.length === 0) return none;
+
+  const seen = new Set<string>();
+  const resolved: ScopeArea[] = [];
+  const unresolved: ScopeArea[] = [];
+  const features: BoundaryFeatureCollection["features"] = [];
+  for (const area of areas) {
+    const key = scopeAreaKey(area);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    let collection: BoundaryFeatureCollection;
+    try {
+      collection = getBoundary(area.level, area.name, area.parentCity, area.parentProvince);
+    } catch {
+      // Unknown/malformed names must degrade to "unresolved", never 500 the scope route.
+      unresolved.push(area);
+      continue;
+    }
+    if (collection.features.length > 0) {
+      resolved.push(area);
+      features.push(...collection.features);
+    } else {
+      unresolved.push(area);
+    }
+  }
+  return {
+    featureCollection: { type: "FeatureCollection", features },
+    resolved,
+    unresolved,
+  };
+}

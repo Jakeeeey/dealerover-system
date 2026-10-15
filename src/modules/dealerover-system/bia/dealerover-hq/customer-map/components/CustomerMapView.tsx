@@ -37,9 +37,10 @@ const CLUSTER_CIRCLE_ID = "customer-cluster-circles";
 const CLUSTER_COUNT_ID = "customer-cluster-count";
 const CLUSTER_POINT_ID = "customer-cluster-points";
 
-// Boundary highlight (selected province/city/barangay): a dark dim mask with
-// the selection cut out as holes, an accent tint over the selection, and a
-// multi-pass neon glow border (blurred halo stack + bright white core).
+// Boundary highlighting runs as TWO groups sharing ONE dim mask:
+//   - BOUNDARY_* below is the dealer's SCOPE (their territory) and gets the full
+//     neon treatment: accent tint, a multi-pass halo and a white-hot core;
+//   - LOCATION_* is the quieter Location-filter annotation.
 // Geometry is corner-cut (Chaikin) so the generalized source polygons read as
 // smooth curves instead of angular segments. Rebuilt in `applyLayers` so
 // basemap swaps keep them.
@@ -62,7 +63,10 @@ const BOUNDARY_LAYER_IDS = [
   LINE_ID,
   CORE_ID,
 ];
-const BOUNDARY_SOURCE_IDS = [BOUNDARY_SOURCE_ID, DIM_SOURCE_ID];
+const LOCATION_SOURCE_ID = "location-highlight";
+const LOCATION_TINT_ID = "location-tint";
+const LOCATION_LINE_ID = "location-line";
+const LOCATION_LAYER_IDS = [LOCATION_TINT_ID, LOCATION_LINE_ID];
 
 /** Chaikin corner-cutting passes applied to the highlight rings (0 = off).
  * The detailed boundaries carry dense vertices, so a single light pass only
@@ -161,7 +165,9 @@ interface CustomerMapViewProps {
   perDealerCounts: Record<string, number>;
   markerStyle: CustomerMapMarkerStyle;
   basemap: CustomerMapBasemap;
-  /** Selected boundary highlight (null = none). Drives the dim/tint/glow layers. */
+  /** The selected dealer's SCOPE (territory). Drives the neon group + dim mask. */
+  scopeHighlight?: BoundaryHighlight | null;
+  /** The Location filter's area (null = none). Drives the quiet dashed annotation. */
   boundaryHighlight?: BoundaryHighlight | null;
   /** Dealer ids in the filter (empty = all). Drives legend chip toggle state. */
   selectedDealerIds: string[];
@@ -240,6 +246,35 @@ function buildMappableData(
 }
 
 type LngLatBounds = [[number, number], [number, number]];
+
+/** [sw, ne] extent of a customer set, or null when there is nothing to frame. */
+function boundsOfCustomers(customers: CustomerMapRow[]): LngLatBounds | null {
+  if (customers.length === 0) return null;
+  let minLng = Infinity;
+  let minLat = Infinity;
+  let maxLng = -Infinity;
+  let maxLat = -Infinity;
+  for (const customer of customers) {
+    minLng = Math.min(minLng, customer.lng);
+    maxLng = Math.max(maxLng, customer.lng);
+    minLat = Math.min(minLat, customer.lat);
+    maxLat = Math.max(maxLat, customer.lat);
+  }
+  return [
+    [minLng, minLat],
+    [maxLng, maxLat],
+  ];
+}
+
+/** Smallest box covering both inputs; either side may be null. */
+function mergeBounds(a: LngLatBounds | null, b: LngLatBounds | null): LngLatBounds | null {
+  if (!a) return b;
+  if (!b) return a;
+  return [
+    [Math.min(a[0][0], b[0][0]), Math.min(a[0][1], b[0][1])],
+    [Math.max(a[1][0], b[1][0]), Math.max(a[1][1], b[1][1])],
+  ];
+}
 
 /** Bounding box of a boundary FeatureCollection's coordinates, or null. */
 function boundsOfHighlight(highlight: BoundaryHighlight | null | undefined): LngLatBounds | null {
@@ -401,12 +436,13 @@ function buildSmoothedHighlight(highlight: BoundaryHighlight): MappableData | nu
 }
 
 /**
- * Builds the dim mask: a world-sized exterior with the (smoothed) selection
- * exterior rings cut out as clockwise holes, so everything OUTSIDE the
- * selection is washed while the selection itself stays bright.
+ * Builds the dim mask from the given exterior rings: a world-sized exterior
+ * with them cut out as clockwise holes, so everything OUTSIDE them is washed
+ * while the highlighted areas stay bright. The caller passes the UNION of the
+ * dealer scope and any Location filter, so one mask serves both.
+ * @param {Ring[]} holes - Smoothed exterior rings to keep bright.
  */
-function buildDimMask(highlight: BoundaryHighlight): MappableData | null {
-  const holes = smoothedExteriorRings(highlight);
+function buildDimMask(holes: Ring[]): MappableData | null {
   if (holes.length === 0) return null;
   const world: Ring = [
     [-180, -90],
@@ -486,58 +522,67 @@ function resolveAccentColor(): string {
 }
 
 /**
- * (Re)builds the boundary highlight layers: a dark dim mask (world wash with
- * the smoothed selection cut out), an accent tint over the selection, and a
- * multi-pass neon border (blurred halo stack + bright white core). Removes
- * everything when the highlight is null/empty. Layer order is enforced
- * bottom-to-top so the dim wash never covers the customer points.
+ * (Re)builds BOTH boundary groups, sharing one dim mask:
+ *   1. the mask — a world-sized wash with the UNION of the dealer's scope and
+ *      any Location filter cut out as holes, so the two never fight over who
+ *      darkens the map;
+ *   2. the SCOPE (BOUNDARY_*) in full neon — the dealer's territory is the thing
+ *      you are meant to see;
+ *   3. the Location FILTER (LOCATION_*) as a quieter dashed annotation.
+ * Both sources always exist (an empty FeatureCollection when unused) so the
+ * layer add/remove code can never race a missing source. Layer order is enforced
+ * bottom-to-top so neither group covers the customer points.
  * @param {MapLibreMap} map - Live MapLibre instance.
- * @param {BoundaryHighlight | null} highlight - Selected boundary, if any.
+ * @param {BoundaryHighlight | null} scope - The dealer's territory, if any.
+ * @param {BoundaryHighlight | null} location - The Location filter's area, if any.
  */
-function applyBoundaryLayers(map: MapLibreMap, highlight: BoundaryHighlight | null): void {
-  const hasSelection = Boolean(highlight && highlight.features.length > 0);
-  const boundaryData = hasSelection && highlight ? buildSmoothedHighlight(highlight) : null;
-  const mask = hasSelection && highlight ? buildDimMask(highlight) : null;
+function applyBoundaryLayers(
+  map: MapLibreMap,
+  scope: BoundaryHighlight | null,
+  location: BoundaryHighlight | null,
+): void {
+  const scopeRings = scope && scope.features.length > 0 ? smoothedExteriorRings(scope) : [];
+  const locationRings =
+    location && location.features.length > 0 ? smoothedExteriorRings(location) : [];
+  const scopeData = scope && scopeRings.length > 0 ? buildSmoothedHighlight(scope) : null;
+  const locationData =
+    location && locationRings.length > 0 ? buildSmoothedHighlight(location) : null;
+  const mask = buildDimMask([...scopeRings, ...locationRings]);
 
-  if (!boundaryData || !mask) {
-    for (const id of BOUNDARY_LAYER_IDS) {
-      try {
-        if (map.getLayer(id)) map.removeLayer(id);
-      } catch {
-        // Layer already gone with a style swap — nothing to do.
-      }
+  const empty = { type: "FeatureCollection", features: [] } as unknown as MappableData;
+  const setSourceData = (id: string, data: MappableData) => {
+    const existing = map.getSource(id) as GeoJSONSource | undefined;
+    if (!existing) map.addSource(id, { type: "geojson", data });
+    else existing.setData(data);
+  };
+  setSourceData(BOUNDARY_SOURCE_ID, scopeData ?? empty);
+  setSourceData(LOCATION_SOURCE_ID, locationData ?? empty);
+
+  // The mask is the one piece that must be REMOVED rather than emptied: with no
+  // holes it would wash the entire world.
+  if (mask) {
+    setSourceData(DIM_SOURCE_ID, mask);
+    if (!map.getLayer(DIM_ID)) {
+      map.addLayer({
+        id: DIM_ID,
+        type: "fill",
+        source: DIM_SOURCE_ID,
+        // Near-black wash so everything outside the highlighted areas is heavily
+        // darkened.
+        paint: { "fill-color": "#000000", "fill-opacity": 0.85 },
+      });
     }
-    for (const source of BOUNDARY_SOURCE_IDS) {
-      try {
-        if (map.getSource(source)) map.removeSource(source);
-      } catch {
-        // Source already gone with a style swap — nothing to do.
-      }
+  } else if (map.getLayer(DIM_ID)) {
+    try {
+      map.removeLayer(DIM_ID);
+    } catch {
+      // Layer already gone with a style swap — nothing to do.
     }
-    return;
   }
-
-  const existingBoundary = map.getSource(BOUNDARY_SOURCE_ID) as GeoJSONSource | undefined;
-  if (!existingBoundary) map.addSource(BOUNDARY_SOURCE_ID, { type: "geojson", data: boundaryData });
-  else existingBoundary.setData(boundaryData);
-
-  const existingDim = map.getSource(DIM_SOURCE_ID) as GeoJSONSource | undefined;
-  if (!existingDim) map.addSource(DIM_SOURCE_ID, { type: "geojson", data: mask });
-  else existingDim.setData(mask);
 
   // Canvas paints (see resolveAccentColor) — re-read every apply so a
   // light/dark flip re-tones the glow without a basemap swap.
   const accent = resolveAccentColor();
-
-  if (!map.getLayer(DIM_ID)) {
-    map.addLayer({
-      id: DIM_ID,
-      type: "fill",
-      source: DIM_SOURCE_ID,
-      // Near-black wash so everything outside the selection is heavily darkened.
-      paint: { "fill-color": "#000000", "fill-opacity": 0.85 },
-    });
-  }
   if (!map.getLayer(TINT_ID)) {
     map.addLayer({
       id: TINT_ID,
@@ -610,16 +655,42 @@ function applyBoundaryLayers(map: MapLibreMap, highlight: BoundaryHighlight | nu
     });
   }
 
-  // Enforce bottom-to-top stacking: dim + tint wash the base map, then the border
-  // (glow + line + core), then heat + customer points ON TOP so the border never
-  // covers a data layer.
+  // The quiet Location annotation: a lighter fill than the scope's tint and a
+  // thin dashed outline instead of a halo, so a filter reads as an inset mark
+  // inside the territory rather than competing with it.
+  if (!map.getLayer(LOCATION_TINT_ID)) {
+    map.addLayer({
+      id: LOCATION_TINT_ID,
+      type: "fill",
+      source: LOCATION_SOURCE_ID,
+      paint: { "fill-color": accent, "fill-opacity": 0.16 },
+    });
+  }
+  map.setPaintProperty(LOCATION_TINT_ID, "fill-color", accent);
+
+  if (!map.getLayer(LOCATION_LINE_ID)) {
+    map.addLayer({
+      id: LOCATION_LINE_ID,
+      type: "line",
+      source: LOCATION_SOURCE_ID,
+      layout: { "line-join": "round", "line-cap": "round" },
+      paint: {
+        "line-color": accent,
+        "line-width": 2,
+        "line-opacity": 0.95,
+        "line-dasharray": [2, 1.5],
+      },
+    });
+  } else {
+    map.setPaintProperty(LOCATION_LINE_ID, "line-color", accent);
+  }
+
+  // Enforce bottom-to-top stacking: the dim wash, then the scope's neon, then
+  // the quiet filter annotation, then heat + customer points ON TOP so no
+  // boundary layer ever covers a data layer.
   for (const id of [
-    DIM_ID,
-    TINT_ID,
-    GLOW_FAR_ID,
-    GLOW_NEAR_ID,
-    LINE_ID,
-    CORE_ID,
+    ...BOUNDARY_LAYER_IDS,
+    ...LOCATION_LAYER_IDS,
     HEAT_ID,
     CIRCLE_ID,
     CLUSTER_CIRCLE_ID,
@@ -719,6 +790,7 @@ export function CustomerMapView({
   perDealerCounts,
   markerStyle,
   basemap,
+  scopeHighlight = null,
   boundaryHighlight = null,
   selectedDealerIds,
   onToggleDealer,
@@ -757,9 +829,10 @@ export function CustomerMapView({
     customers,
     colors,
     markerStyle,
+    scopeHighlight,
     boundaryHighlight,
   });
-  latest.current = { customers, colors, markerStyle, boundaryHighlight };
+  latest.current = { customers, colors, markerStyle, scopeHighlight, boundaryHighlight };
 
   // (Re)builds the source + layers and applies visibility. Called on the initial
   // style load, after every basemap style swap, and on data/style changes. No
@@ -893,7 +966,7 @@ export function CustomerMapView({
       show(CLUSTER_COUNT_ID, isClusters);
       show(CLUSTER_POINT_ID, isClusters);
 
-      applyBoundaryLayers(map, state.boundaryHighlight);
+      applyBoundaryLayers(map, state.scopeHighlight, state.boundaryHighlight);
     } catch {
       // Transient style races are recovered on the next style.load / idle / render.
     }
@@ -1036,7 +1109,7 @@ export function CustomerMapView({
     const map = mapRef.current;
     if (!map || !mapReady) return;
     applyLayers(map);
-  }, [customers, colors, markerStyle, boundaryHighlight, mapReady, applyLayers]);
+  }, [customers, colors, markerStyle, scopeHighlight, boundaryHighlight, mapReady, applyLayers]);
 
   // Re-tone the glow when light/dark flips (next-themes toggles the class on
   // <html> without reloading the map style, so applyLayers would not re-run).
@@ -1070,26 +1143,15 @@ export function CustomerMapView({
         ? previous
         : { kind: "list", customers: remaining };
     });
-    // Prefer the selected boundary's extent (a Location filter) so the whole
-    // province / city / barangay is framed; fall back to the customers' extent
-    // for attribute-only filters.
-    let bounds = boundsOfHighlight(boundaryHighlight);
-    if (!bounds && customers.length > 0) {
-      let minLng = Infinity;
-      let minLat = Infinity;
-      let maxLng = -Infinity;
-      let maxLat = -Infinity;
-      for (const customer of customers) {
-        minLng = Math.min(minLng, customer.lng);
-        maxLng = Math.max(maxLng, customer.lng);
-        minLat = Math.min(minLat, customer.lat);
-        maxLat = Math.max(maxLat, customer.lat);
-      }
-      bounds = [
-        [minLng, minLat],
-        [maxLng, maxLat],
-      ];
-    }
+    // Frame what the user is looking at. With a scope that means the territory
+    // AND every customer of that dealer: the entire point of a scope is spotting
+    // customers OUTSIDE it, so fitting tightly to the territory would crop the
+    // very dots worth seeing. A Location filter needs no union — it narrows the
+    // rows to itself, so its own area already contains them — and an
+    // attribute-only filter falls back to the customers' extent.
+    const bounds = scopeHighlight
+      ? mergeBounds(boundsOfHighlight(scopeHighlight), boundsOfCustomers(customers))
+      : (boundsOfHighlight(boundaryHighlight) ?? boundsOfCustomers(customers));
     if (bounds) {
       // The zoom ceiling is high so small cities / barangays still fill the view
       // (vector tiles overzoom crisply); the left padding keeps the region clear
@@ -1102,7 +1164,7 @@ export function CustomerMapView({
         duration: 600,
       });
     }
-  }, [customers, boundaryHighlight, mapReady]);
+  }, [customers, scopeHighlight, boundaryHighlight, mapReady]);
 
   // Full-bleed stage: the map is the base layer (z-0) and every strip is a
   // floating glass overlay — offline pill top-center (z-10), legend pill

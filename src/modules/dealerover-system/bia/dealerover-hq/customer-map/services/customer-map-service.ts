@@ -1,5 +1,5 @@
 import { type CustomerMapRow, type LookupItem } from "../types";
-import { resolveAdmin } from "./boundaries-service";
+import { resolveAdmin, type ScopeArea } from "./boundaries-service";
 
 /**
  * Server-only aggregation for the HQ customer map.
@@ -376,6 +376,102 @@ export async function fetchDealerRoster(): Promise<
       dealerCode: identity.dealerCode,
     };
   });
+}
+
+/** Scope read budget. The scope table is a tiny row set on main Directus, so it
+ * stays tight like the roster: a dead registry must not hold the map open. */
+const SCOPE_TIMEOUT_MS = 6000;
+/** Scopes change rarely (hand-maintained by the owner), so a short cache avoids
+ * re-querying main Directus on every map open or dealer switch. */
+const DEALER_SCOPE_TTL_MS = 5 * 60 * 1000;
+
+// Pinned to globalThis, not module scope: Next.js dev HMR re-executes this
+// module on every edit, wiping module-level state and re-hammering Directus.
+// Pinning keeps the warm scope map alive across reloads in dev (harmless in
+// prod — one server instance, one cache).
+const globalForScopes = globalThis as unknown as {
+  __dealeroverScopeCache?: { data: Record<string, ScopeArea[]> | null; expiry: number };
+};
+const DEALER_SCOPE_CACHE =
+  globalForScopes.__dealeroverScopeCache ??
+  (globalForScopes.__dealeroverScopeCache = { data: null, expiry: 0 });
+
+interface ScopeRow {
+  dealer_id?: number | string | null;
+  level?: string | null;
+  name?: string | null;
+  parent_province?: string | null;
+  parent_city?: string | null;
+}
+
+/** Narrows a raw `level` cell to a drawable boundary level. */
+function isScopeLevel(value: unknown): value is ScopeArea["level"] {
+  return value === "province" || value === "city" || value === "barangay";
+}
+
+/**
+ * Reads every dealer's assigned territory from the head-office `dealer_scope`
+ * collection, grouped by dealer id. The owner has not created that collection
+ * yet, so an absent/unreadable table (403/404/timeout/network/garbage payload)
+ * is an EXPECTED state, not an error: it logs one line and resolves scopeless.
+ * Failures are never cached, so the collection is picked up as soon as it appears.
+ * @returns {Promise<Record<string, ScopeArea[]>>} dealerId -> its scope areas. Empty when the collection is absent or unreadable.
+ */
+export async function fetchDealerScopes(): Promise<Record<string, ScopeArea[]>> {
+  const now = Date.now();
+  if (DEALER_SCOPE_CACHE.data && DEALER_SCOPE_CACHE.expiry > now) {
+    return DEALER_SCOPE_CACHE.data;
+  }
+
+  let payload: unknown;
+  try {
+    payload = await fetchJson(
+      `${UPSTREAM}/items/dealer_scope?limit=-1&fields=dealer_id,level,name,parent_province,parent_city`,
+      {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${STATIC_TOKEN}`,
+      },
+      AbortSignal.timeout(SCOPE_TIMEOUT_MS),
+    );
+  } catch {
+    console.error(
+      "ERR_SCOPE_FAIL: [CustomerMap] dealer_scope unavailable — no dealer scopes loaded",
+    );
+    return {};
+  }
+  const raw = Array.isArray(payload)
+    ? payload
+    : (payload as { data?: unknown } | null)?.data;
+  if (!Array.isArray(raw)) {
+    console.error(
+      "ERR_SCOPE_FAIL: [CustomerMap] dealer_scope unavailable — no dealer scopes loaded",
+    );
+    return {};
+  }
+
+  // Drop anything the map cannot draw: unknown levels, blank names, and rows
+  // with no dealer to attach to. Hints ride along only when present — an empty
+  // hint would over-constrain getBoundary into returning nothing.
+  const grouped: Record<string, ScopeArea[]> = {};
+  for (const row of raw) {
+    if (typeof row !== "object" || row === null) continue;
+    const entry = row as ScopeRow;
+    if (!isScopeLevel(entry.level)) continue;
+    const name = str(entry.name);
+    if (!name) continue;
+    if (entry.dealer_id === null || entry.dealer_id === undefined) continue;
+    const dealerKey = String(entry.dealer_id).trim();
+    if (!dealerKey) continue;
+    const area: ScopeArea = { level: entry.level, name };
+    const parentCity = str(entry.parent_city);
+    const parentProvince = str(entry.parent_province);
+    if (parentCity) area.parentCity = parentCity;
+    if (parentProvince) area.parentProvince = parentProvince;
+    (grouped[dealerKey] ??= []).push(area);
+  }
+  DEALER_SCOPE_CACHE.data = grouped;
+  DEALER_SCOPE_CACHE.expiry = Date.now() + DEALER_SCOPE_TTL_MS;
+  return grouped;
 }
 
 /**

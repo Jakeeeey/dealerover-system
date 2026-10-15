@@ -7,6 +7,7 @@ import { formatNumber } from "@/lib/utils";
 import {
   GroupedFilterFields,
   countActiveFilters,
+  hasResetableState,
   type CustomerMapFilterProps,
 } from "./CustomerMapFilterFields";
 
@@ -62,7 +63,7 @@ export function CustomerMapSidebar(props: CustomerMapFilterProps) {
             size="icon"
             className="size-9"
             onClick={onReset}
-            disabled={disabled || activeCount === 0}
+            disabled={disabled || !hasResetableState(props.filters, props.scopeDealerId)}
             aria-label="Reset filters"
             title="Reset filters"
           >
